@@ -118,10 +118,10 @@ for (const device of devices) {
 
 // setInterval(()=>{
 //       socket.emit("attendance_micro", {
-//         deviceUserId:10220,
+//         deviceUserId:10116,
 //         recordTime: new Date().toISOString(),
 //       });
-// },1000)
+// },5000)
 
 // Health check: ping connected devices, reconnect disconnected ones
 setInterval(() => {
