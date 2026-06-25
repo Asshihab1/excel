@@ -187,8 +187,13 @@ class ZKLibTCP {
     return new Promise((resolve, reject) => {
       this.socket = new net.Socket();
       this.socket.once("error", (err) => { reject(err); cbError && cbError(err); });
-      this.socket.once("connect", () => resolve(this.socket));
+      this.socket.once("connect", () => {
+        this.socket.setTimeout(0);          // clear connection timeout
+        this.socket.setKeepAlive(true, 5000); // OS-level dead-peer detection
+        resolve(this.socket);
+      });
       this.socket.once("close", () => { this.socket = null; cbClose && cbClose("tcp"); });
+      this.socket.on("timeout", () => { this.socket.destroy(); }); // destroy → fires close → triggers cbClose
       if (this.timeout) this.socket.setTimeout(this.timeout);
       this.socket.connect(this.port, this.ip);
     });
@@ -370,6 +375,10 @@ class ZKLibTCP {
 
   async freeData() {
     return this.executeCmd(COMMANDS.CMD_FREE_DATA, "");
+  }
+
+  async ping() {
+    return this.executeCmd(COMMANDS.CMD_GET_FREE_SIZES, "");
   }
 
   async disconnect() {
@@ -584,6 +593,10 @@ class ZKLibUDP {
     return this.executeCmd(COMMANDS.CMD_FREE_DATA, "");
   }
 
+  async ping() {
+    return this.executeCmd(COMMANDS.CMD_GET_FREE_SIZES, "");
+  }
+
   async disconnect() {
     try { await this.executeCmd(COMMANDS.CMD_EXIT, ""); } catch {}
     return this.closeSocket();
@@ -643,6 +656,10 @@ class ZKLib {
 
   async getUsers() {
     return this.functionWrapper(() => this.zklibTcp.getUsers(), () => this.zklibUdp.getUsers());
+  }
+
+  async ping() {
+    return this.functionWrapper(() => this.zklibTcp.ping(), () => this.zklibUdp.ping());
   }
 
   async getAttendances(cb) { 
