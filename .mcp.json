@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "zkteco": {
+      "command": "node",
+      "args": ["mcp-server.js"],
+      "cwd": "/Users/shihab/Desktop/socket-client"
+    }
+  }
+}
