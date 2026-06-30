@@ -118,7 +118,7 @@ for (const device of devices) {
 
 // setInterval(()=>{
 //       socket.emit("attendance_micro", {
-//         deviceUserId:10116,
+//         deviceUserId:10011,
 //         recordTime: new Date().toISOString(),
 //       });
 // },5000)
