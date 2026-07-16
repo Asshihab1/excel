@@ -25,6 +25,28 @@ type CtxMenu =
 
 type Sel = { r1: number; c1: number; r2: number; c2: number };
 
+type CellFormat = {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  fontFamily?: string;
+  fontSize?: number;
+  color?: string;
+  bgColor?: string;
+};
+type SheetFmt = Record<string, CellFormat>;
+type FileFmt = Record<string, SheetFmt>;
+
+const FONT_FAMILIES = [
+  { label: "Default",           value: "" },
+  { label: "Arial",             value: "Arial, sans-serif" },
+  { label: "Times New Roman",   value: "'Times New Roman', serif" },
+  { label: "Courier New",       value: "'Courier New', monospace" },
+  { label: "Georgia",           value: "Georgia, serif" },
+  { label: "Verdana",           value: "Verdana, sans-serif" },
+];
+const FONT_SIZES = [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36];
+
 const TRAILING_EMPTY = 20;
 
 function normSel(s: Sel): Sel {
@@ -54,6 +76,51 @@ function Divider() {
   return <div style={{ height: 1, background: COLOR.border, margin: "3px 0" }} />;
 }
 
+function FmtBar({ selFmt, onApply, onClear }: { selFmt: CellFormat; onApply: (p: Partial<CellFormat>) => void; onClear: () => void }) {
+  const btn = (active: boolean): React.CSSProperties => ({
+    width: 24, height: 24, border: `1px solid ${active ? "#3b82f6" : "#e2e8f0"}`,
+    borderRadius: 3, cursor: "pointer", background: active ? "#dbeafe" : "#fff",
+    display: "flex", alignItems: "center", justifyContent: "center", padding: 0, flexShrink: 0,
+  });
+  const sep = <div style={{ width: 1, height: 16, background: "#e2e8f0", margin: "0 2px" }} />;
+  return (
+    <div style={{ padding: "6px 8px", borderBottom: "1px solid #e2e8f0", display: "flex", gap: 3, alignItems: "center", flexWrap: "wrap" }}>
+      <button title="Bold" style={{ ...btn(!!selFmt.bold), fontWeight: 700, fontSize: 12 }} onClick={() => onApply({ bold: !selFmt.bold })}>B</button>
+      <button title="Italic" style={{ ...btn(!!selFmt.italic), fontStyle: "italic", fontSize: 12 }} onClick={() => onApply({ italic: !selFmt.italic })}>I</button>
+      <button title="Underline" style={{ ...btn(!!selFmt.underline), textDecoration: "underline", fontSize: 12 }} onClick={() => onApply({ underline: !selFmt.underline })}>U</button>
+      {sep}
+      <select
+        title="Font family"
+        value={selFmt.fontFamily ?? ""}
+        onChange={(e) => onApply({ fontFamily: e.target.value || undefined })}
+        style={{ fontSize: 11, border: "1px solid #e2e8f0", borderRadius: 3, padding: "2px 2px", maxWidth: 90, height: 24, color: "#0f172a" }}
+      >
+        {FONT_FAMILIES.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+      </select>
+      <select
+        title="Font size"
+        value={selFmt.fontSize ?? ""}
+        onChange={(e) => onApply({ fontSize: e.target.value ? Number(e.target.value) : undefined })}
+        style={{ fontSize: 11, border: "1px solid #e2e8f0", borderRadius: 3, padding: "2px 2px", width: 46, height: 24, color: "#0f172a" }}
+      >
+        <option value="">sz</option>
+        {FONT_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
+      </select>
+      {sep}
+      <label title="Text color" style={{ position: "relative", cursor: "pointer" }}>
+        <div style={{ width: 24, height: 24, borderRadius: 3, border: "1px solid #e2e8f0", background: selFmt.color ?? "#0f172a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#fff", fontWeight: 700 }}>A</div>
+        <input type="color" value={selFmt.color ?? "#0f172a"} onChange={(e) => onApply({ color: e.target.value })} style={{ position: "absolute", opacity: 0, inset: 0, cursor: "pointer", width: "100%", height: "100%" }} />
+      </label>
+      <label title="Background color" style={{ position: "relative", cursor: "pointer" }}>
+        <div style={{ width: 24, height: 24, borderRadius: 3, border: "1px solid #e2e8f0", background: selFmt.bgColor ?? "#ffffff", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}>▣</div>
+        <input type="color" value={selFmt.bgColor ?? "#ffffff"} onChange={(e) => onApply({ bgColor: e.target.value })} style={{ position: "absolute", opacity: 0, inset: 0, cursor: "pointer", width: "100%", height: "100%" }} />
+      </label>
+      {sep}
+      <button title="Clear formatting" style={{ ...btn(false), fontSize: 11, width: "auto", padding: "0 5px", color: "#94a3b8" }} onClick={onClear}>✕ fmt</button>
+    </div>
+  );
+}
+
 export default function App() {
   const [files, setFiles] = useState<string[]>([]);
   const [activeFile, setActiveFile] = useState<string | null>(null);
@@ -69,6 +136,7 @@ export default function App() {
   const [focusedCell, setFocusedCell] = useState<{ row: number; col: string } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const [sel, setSel] = useState<Sel | null>(null);
+  const [formatting, setFormatting] = useState<FileFmt>({});
   const draggingRef = useRef(false);
 
   const headerInputRef = useRef<HTMLInputElement>(null);
@@ -129,13 +197,15 @@ export default function App() {
   }
 
   async function openFile(name: string) {
-    const res = await fetch(`${API}/${name}`);
+    const [res, fmtRes] = await Promise.all([fetch(`${API}/${name}`), fetch(`${API}/${name}/format`)]);
     const json = await res.json();
+    const fmt = await fmtRes.json();
     setActiveFile(name);
     setSheets(json.sheets);
     setActiveSheet(json.sheets[0]);
     setData(json.data);
     setColOrder(json.colOrder ?? {});
+    setFormatting(fmt ?? {});
   }
 
   async function saveData(dataToSave: SheetData, colOrderToSave: Record<string, string[]>) {
@@ -157,6 +227,13 @@ export default function App() {
 
   async function saveFile() {
     await saveData(data, colOrder);
+    if (activeFile) {
+      await fetch(`${API}/${activeFile}/format`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(formatting),
+      });
+    }
   }
 
   async function createFile() {
@@ -346,6 +423,64 @@ export default function App() {
     setSel(null);
   }
 
+  const fmtKey = (ri: number, col: string) => `${ri}:${col}`;
+
+  const getCellFmt = (sheet: string, ri: number, col: string): CellFormat =>
+    formatting[sheet]?.[fmtKey(ri, col)] ?? {};
+
+  function getSelFmt(sheet: string): CellFormat {
+    if (!sel) return {};
+    const s = normSel(sel);
+    const sheetCols = columns(sheet);
+    let first: CellFormat | null = null;
+    let allBold = true, allItalic = true, allUnderline = true;
+    for (let r = s.r1; r <= s.r2; r++) {
+      for (let c = s.c1; c <= s.c2; c++) {
+        const col = sheetCols[c]; if (!col) continue;
+        const f = getCellFmt(sheet, r, col);
+        if (!first) first = f;
+        if (!f.bold) allBold = false;
+        if (!f.italic) allItalic = false;
+        if (!f.underline) allUnderline = false;
+      }
+    }
+    if (!first) return {};
+    return { ...first, bold: allBold, italic: allItalic, underline: allUnderline };
+  }
+
+  function applyFmt(sheet: string, patch: Partial<CellFormat>) {
+    if (!sel) return;
+    const s = normSel(sel);
+    const sheetCols = columns(sheet);
+    setFormatting((prev) => {
+      const sheetFmt = { ...(prev[sheet] ?? {}) };
+      for (let r = s.r1; r <= s.r2; r++) {
+        for (let c = s.c1; c <= s.c2; c++) {
+          const col = sheetCols[c]; if (!col) continue;
+          const key = fmtKey(r, col);
+          sheetFmt[key] = { ...(sheetFmt[key] ?? {}), ...patch };
+        }
+      }
+      return { ...prev, [sheet]: sheetFmt };
+    });
+  }
+
+  function clearFmt(sheet: string) {
+    if (!sel) return;
+    const s = normSel(sel);
+    const sheetCols = columns(sheet);
+    setFormatting((prev) => {
+      const sheetFmt = { ...(prev[sheet] ?? {}) };
+      for (let r = s.r1; r <= s.r2; r++) {
+        for (let c = s.c1; c <= s.c2; c++) {
+          const col = sheetCols[c]; if (!col) continue;
+          delete sheetFmt[fmtKey(r, col)];
+        }
+      }
+      return { ...prev, [sheet]: sheetFmt };
+    });
+  }
+
   function addSheet() {
     const name = prompt("Sheet name:");
     if (!name?.trim()) return;
@@ -521,13 +656,18 @@ export default function App() {
                         {cols.map((c, ci) => {
                           const selected = inSel(i, ci);
                           const focused = focusedCell?.row === i && focusedCell.col === c;
+                          const fmt = getCellFmt(activeSheet, i, c);
                           return (
                             <td
                               key={c}
                               onMouseDown={(e) => { if (e.button === 0) startSel(e, i, ci); }}
                               onMouseEnter={() => extendSel(i, ci)}
                               onContextMenu={(e) => openCtx(e, { kind: "cell", x: e.clientX, y: e.clientY, rowIdx: i, colIdx: ci, isReal })}
-                              style={{ border: selected ? "1px solid #3b82f6" : `1px solid ${COLOR.border}`, padding: 0, background: selected ? "#dbeafe" : "transparent" }}
+                              style={{
+                                border: selected ? "1px solid #3b82f6" : `1px solid ${COLOR.border}`,
+                                padding: 0,
+                                background: selected ? "#dbeafe" : (fmt.bgColor ?? "transparent"),
+                              }}
                             >
                               <input
                                 value={String(row[c] ?? "")}
@@ -539,7 +679,13 @@ export default function App() {
                                   width: "100%", border: "none", padding: "5px 8px",
                                   outline: focused ? `2px solid ${COLOR.cellFocusBorder}` : "none",
                                   background: "transparent",
-                                  boxSizing: "border-box", fontFamily: MONO, fontSize: 12, color: COLOR.cellText,
+                                  boxSizing: "border-box",
+                                  fontFamily: fmt.fontFamily ?? MONO,
+                                  fontSize: fmt.fontSize ?? 12,
+                                  color: fmt.color ?? COLOR.cellText,
+                                  fontWeight: fmt.bold ? 700 : 400,
+                                  fontStyle: fmt.italic ? "italic" : "normal",
+                                  textDecoration: fmt.underline ? "underline" : "none",
                                 }}
                               />
                             </td>
@@ -594,6 +740,11 @@ export default function App() {
             </>)}
 
             {ctxMenu.kind === "cell" && (<>
+              <FmtBar
+                selFmt={getSelFmt(activeSheet)}
+                onApply={(patch) => applyFmt(activeSheet, patch)}
+                onClear={() => clearFmt(activeSheet)}
+              />
               {sel && (() => { const s = normSel(sel); return s.r2 > s.r1 || s.c2 > s.c1; })() && (
                 <div style={{ padding: "4px 14px 2px", fontSize: 11, color: COLOR.rowNumText, fontFamily: FONT }}>
                   {(() => { const s = normSel(sel); return `${s.r2 - s.r1 + 1} rows × ${s.c2 - s.c1 + 1} cols selected`; })()}

@@ -113,6 +113,8 @@ app.patch("/api/files/:name/rename", (req, res) => {
   const newPath = path.join(FILES_DIR, newName);
   if (fs.existsSync(newPath)) return res.status(409).json({ error: "Name already taken" });
   fs.renameSync(oldPath, newPath);
+  const oldFmt = oldPath + ".fmt.json";
+  if (fs.existsSync(oldFmt)) fs.renameSync(oldFmt, newPath + ".fmt.json");
   res.json({ ok: true, file: newName });
 });
 
@@ -125,11 +127,27 @@ app.get("/api/files/:name/download", (req, res) => {
   res.sendFile(filePath);
 });
 
+// GET /api/files/:name/format — load cell formatting sidecar
+app.get("/api/files/:name/format", (req, res) => {
+  const fmtPath = path.join(FILES_DIR, req.params.name + ".fmt.json");
+  if (!fs.existsSync(fmtPath)) return res.json({});
+  res.json(JSON.parse(fs.readFileSync(fmtPath, "utf8")));
+});
+
+// PUT /api/files/:name/format — save cell formatting sidecar
+app.put("/api/files/:name/format", (req, res) => {
+  const fmtPath = path.join(FILES_DIR, req.params.name + ".fmt.json");
+  fs.writeFileSync(fmtPath, JSON.stringify(req.body ?? {}));
+  res.json({ ok: true });
+});
+
 // DELETE /api/files/:name — delete file
 app.delete("/api/files/:name", (req, res) => {
   const filePath = path.join(FILES_DIR, req.params.name);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
   fs.unlinkSync(filePath);
+  const fmtPath = filePath + ".fmt.json";
+  if (fs.existsSync(fmtPath)) fs.unlinkSync(fmtPath);
   res.json({ ok: true });
 });
 
