@@ -236,6 +236,100 @@ export default function App() {
     }
   }
 
+  const [printOpts, setPrintOpts] = useState<{
+    paper: string; orientation: string; margin: string;
+    fontSize: number; gridlines: boolean; zebra: boolean;
+    repeatHeader: boolean; showTitle: boolean; scale: string;
+  } | null>(null);
+
+  function doPrint(opts: NonNullable<typeof printOpts>) {
+    if (!activeSheet) return;
+    const sheetCols = columns(activeSheet);
+    const sheetRows = data[activeSheet] ?? [];
+    const sheetFmt = formatting[activeSheet] ?? {};
+
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    const cellStyle = (ri: number, col: string) => {
+      const f = sheetFmt[`${ri}:${col}`] ?? {};
+      return [
+        f.bold       ? "font-weight:700"           : "",
+        f.italic     ? "font-style:italic"          : "",
+        f.underline  ? "text-decoration:underline"  : "",
+        f.fontFamily ? `font-family:${f.fontFamily}` : "",
+        f.fontSize   ? `font-size:${f.fontSize}px`  : "",
+        f.color      ? `color:${f.color}`            : "",
+        f.bgColor    ? `background:${f.bgColor};-webkit-print-color-adjust:exact;print-color-adjust:exact` : "",
+      ].filter(Boolean).join(";");
+    };
+
+    const marginMap: Record<string, string> = { none: "0", narrow: "8mm", normal: "15mm", wide: "25mm" };
+    const margin = marginMap[opts.margin] ?? "15mm";
+    const scaleMap: Record<string, string> = { auto: "auto", fit: "fit", "100": "100%", "90": "90%", "80": "80%", "75": "75%" };
+    const scale = scaleMap[opts.scale] ?? "auto";
+
+    const headerRow = sheetCols.map((col) => `<th>${esc(col)}</th>`).join("");
+    const theadHtml = opts.repeatHeader
+      ? `<thead><tr>${headerRow}</tr></thead>`
+      : `<thead><tr>${headerRow}</tr></thead>`;
+
+    const rows = sheetRows.map((row, ri) => {
+      const evenStyle = opts.zebra && ri % 2 === 1 ? " class=\"alt\"" : "";
+      const cells = sheetCols.map((col) => {
+        const val = esc(String(row[col] ?? ""));
+        const s = cellStyle(ri, col);
+        return `<td${s ? ` style="${s}"` : ""}>${val}</td>`;
+      }).join("");
+      return `<tr${evenStyle}>${cells}</tr>`;
+    }).join("");
+
+    const borderCss = opts.gridlines
+      ? "th,td { border: 1px solid #aaa; }"
+      : "th,td { border: 1px solid transparent; } thead th { border-bottom: 2px solid #333; }";
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${esc(activeFile ?? "")} — ${esc(activeSheet)}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: ${opts.fontSize}px; color: #111; padding: 16px; }
+  h1 { font-size: ${opts.fontSize + 3}px; font-weight: 700; margin-bottom: 3px; color: #1e293b; }
+  .meta { font-size: ${opts.fontSize - 1}px; color: #64748b; margin-bottom: 14px; }
+  table { border-collapse: collapse; width: 100%; table-layout: auto; }
+  th { background: #1e293b; color: #f1f5f9; text-align: left; padding: 5px 8px; font-weight: 700; letter-spacing: 0.03em; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  td { padding: 4px 8px; vertical-align: middle; }
+  tr.alt td { background: #f1f5f9; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  ${borderCss}
+  @media print {
+    body { padding: 0; }
+    @page { size: ${opts.paper} ${opts.orientation}; margin: ${margin}; }
+    ${scale !== "auto" && scale !== "fit" ? `html { zoom: ${scale}; }` : ""}
+    ${scale === "fit" ? "table { width: 100% !important; } body { overflow: hidden; }" : ""}
+    thead { display: table-header-group; }
+    tfoot { display: table-footer-group; }
+    tr { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+${opts.showTitle ? `<h1>${esc(activeFile ?? "")}</h1><p class="meta">Sheet: ${esc(activeSheet)} &nbsp;·&nbsp; ${sheetRows.length} rows &nbsp;·&nbsp; ${sheetCols.length} columns</p>` : ""}
+<table>
+${theadHtml}
+<tbody>${rows}</tbody>
+</table>
+<script>window.onload = function() { window.print(); };<\/script>
+</body>
+</html>`;
+
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const win = window.open(url, "_blank", "width=960,height=720");
+    if (win) win.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
+    setPrintOpts(null);
+  }
+
   async function createFile() {
     const name = newFileName.trim();
     if (!name) return;
@@ -571,6 +665,12 @@ export default function App() {
               >
                 ⬇ Export
               </button>
+              <button
+                onClick={() => setPrintOpts({ paper: "A4", orientation: "portrait", margin: "normal", fontSize: 12, gridlines: true, zebra: true, repeatHeader: true, showTitle: true, scale: "auto" })}
+                style={{ padding: "4px 14px", background: "#64748b", color: "#fff", border: "none", borderRadius: 5, cursor: "pointer", fontFamily: FONT, fontSize: 12, fontWeight: 600 }}
+              >
+                🖨 Print
+              </button>
               <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
                 <input
                   placeholder="Column name"
@@ -756,6 +856,66 @@ export default function App() {
               <CtxItem label="🧹  Clear Selection" onClick={() => { closeCtx(); clearSelection(activeSheet); }} />
               {ctxMenu.isReal && <CtxItem label="🗑  Delete Selected Rows" danger onClick={() => { closeCtx(); deleteSelectedRows(activeSheet); }} />}
             </>)}
+          </div>
+        </>
+      )}
+
+      {/* ── Print Options Modal ── */}
+      {printOpts && (
+        <>
+          <div style={{ position: "fixed", inset: 0, zIndex: 199, background: "rgba(0,0,0,0.35)" }} onClick={() => setPrintOpts(null)} />
+          <div style={{
+            position: "fixed", zIndex: 200, top: "50%", left: "50%", transform: "translate(-50%,-50%)",
+            background: "#fff", borderRadius: 10, boxShadow: "0 16px 48px rgba(0,0,0,0.22)",
+            padding: "24px 28px", minWidth: 360, fontFamily: FONT, fontSize: 13, color: COLOR.cellText,
+          }}>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 18 }}>🖨 Print Options</div>
+
+            {([
+              ["Paper Size", "paper", [["A4","A4"],["Letter","Letter"],["Legal","Legal"],["A3","A3"],["A5","A5"]]],
+              ["Orientation", "orientation", [["Portrait","portrait"],["Landscape","landscape"]]],
+              ["Margins", "margin", [["Normal","normal"],["Narrow","narrow"],["Wide","wide"],["None","none"]]],
+              ["Font Size", "fontSize", [["10px","10"],["11px","11"],["12px","12"],["13px","13"],["14px","14"],["16px","16"]]],
+              ["Scale", "scale", [["Auto","auto"],["Fit Width","fit"],["100%","100"],["90%","90"],["80%","80"],["75%","75"]]],
+            ] as [string, string, [string,string][]][]).map(([label, key, opts]) => (
+              <div key={key} style={{ display: "flex", alignItems: "center", marginBottom: 10, gap: 8 }}>
+                <span style={{ width: 100, fontSize: 12, color: COLOR.rowNumText, flexShrink: 0 }}>{label}</span>
+                <select
+                  value={key === "fontSize" ? String(printOpts.fontSize) : (printOpts as Record<string,unknown>)[key] as string}
+                  onChange={(e) => setPrintOpts((p) => p ? ({ ...p, [key]: key === "fontSize" ? Number(e.target.value) : e.target.value }) : null)}
+                  style={{ flex: 1, padding: "4px 6px", border: `1px solid ${COLOR.border}`, borderRadius: 5, fontFamily: FONT, fontSize: 12, color: COLOR.cellText }}
+                >
+                  {opts.map(([lbl, val]) => <option key={val} value={val}>{lbl}</option>)}
+                </select>
+              </div>
+            ))}
+
+            <div style={{ height: 1, background: COLOR.border, margin: "12px 0" }} />
+
+            {([
+              ["Show gridlines",            "gridlines"],
+              ["Alternating row colors",    "zebra"],
+              ["Repeat header on each page","repeatHeader"],
+              ["Show file & sheet title",   "showTitle"],
+            ] as [string, string][]).map(([label, key]) => (
+              <label key={key} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, cursor: "pointer", fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={(printOpts as Record<string,unknown>)[key] as boolean}
+                  onChange={(e) => setPrintOpts((p) => p ? ({ ...p, [key]: e.target.checked }) : null)}
+                />
+                {label}
+              </label>
+            ))}
+
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 18 }}>
+              <button onClick={() => setPrintOpts(null)} style={{ padding: "6px 18px", border: `1px solid ${COLOR.border}`, borderRadius: 6, cursor: "pointer", fontFamily: FONT, fontSize: 12, background: "#fff", color: COLOR.cellText }}>
+                Cancel
+              </button>
+              <button onClick={() => doPrint(printOpts)} style={{ padding: "6px 18px", background: "#64748b", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: FONT, fontSize: 12, fontWeight: 600 }}>
+                🖨 Print
+              </button>
+            </div>
           </div>
         </>
       )}
