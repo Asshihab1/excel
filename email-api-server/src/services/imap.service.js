@@ -1,22 +1,22 @@
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 
-function getClient() {
+function getClient(account) {
   return new ImapFlow({
-    host: process.env.IMAP_HOST,
-    port: Number(process.env.IMAP_PORT),
-    secure: false, // STARTTLS negotiated in-band; snake-oil cert, not verified
+    host: account.imapHost,
+    port: Number(account.imapPort),
+    secure: false, // STARTTLS negotiated in-band; snake-oil cert on local mailcow, not verified
     tls: { rejectUnauthorized: false },
     auth: {
-      user: process.env.IMAP_USER,
-      pass: process.env.IMAP_PASSWORD,
+      user: account.email,
+      pass: account.password,
     },
     logger: false,
   });
 }
 
-async function withClient(fn) {
-  const client = getClient();
+async function withClient(account, fn) {
+  const client = getClient(account);
   await client.connect();
   try {
     return await fn(client);
@@ -42,8 +42,8 @@ async function resolveFolderPath(client, key) {
   return match ? match.path : wanted;
 }
 
-async function listFolders() {
-  return withClient(async (client) => {
+async function listFolders(account) {
+  return withClient(account, async (client) => {
     const list = await client.list();
     return list.map((box) => ({
       key: box.name.toLowerCase(),
@@ -53,8 +53,8 @@ async function listFolders() {
   });
 }
 
-async function getFolderMessages(folderKey) {
-  return withClient(async (client) => {
+async function getFolderMessages(account, folderKey) {
+  return withClient(account, async (client) => {
     const path = await resolveFolderPath(client, folderKey);
     const lock = await client.getMailboxLock(path);
     try {
@@ -81,9 +81,9 @@ function decodeId(id) {
   return { folderKey, uid: Number(uid) };
 }
 
-async function getMessageById(id) {
+async function getMessageById(account, id) {
   const { folderKey, uid } = decodeId(id);
-  return withClient(async (client) => {
+  return withClient(account, async (client) => {
     const path = await resolveFolderPath(client, folderKey);
     const lock = await client.getMailboxLock(path);
     try {
@@ -110,9 +110,9 @@ async function getMessageById(id) {
   });
 }
 
-async function deleteMessage(id) {
+async function deleteMessage(account, id) {
   const { folderKey, uid } = decodeId(id);
-  return withClient(async (client) => {
+  return withClient(account, async (client) => {
     const path = await resolveFolderPath(client, folderKey);
     const trashPath = await resolveFolderPath(client, 'trash');
     const lock = await client.getMailboxLock(path);

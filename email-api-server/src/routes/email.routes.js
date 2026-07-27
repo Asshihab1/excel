@@ -3,6 +3,7 @@ const multer = require('multer');
 const { z } = require('zod');
 const controller = require('../controllers/email.controller');
 const { requireAuth } = require('../middleware/auth.middleware');
+const { resolveAccount } = require('../middleware/resolveAccount');
 const { validateBody } = require('../middleware/validate');
 
 const router = express.Router();
@@ -23,6 +24,7 @@ const sendEmailSchema = z.object({
 });
 
 router.use(requireAuth);
+router.use(resolveAccount);
 
 // specific routes first, /:id must come last
 router.post('/send', upload.array('attachments'), validateBody(sendEmailSchema), controller.sendEmail);

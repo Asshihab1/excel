@@ -200,6 +200,7 @@
   <header>
     <div class="logo">Local Mail</div>
     <input type="text" placeholder="Search mail (not implemented)" disabled>
+    <select id="accountSwitcher" onchange="onAccountSwitcherChange(this.value)"></select>
     <button onclick="logout()" style="border:none;background:none;cursor:pointer;color:#5f6368;">Log out</button>
   </header>
 
@@ -234,11 +235,31 @@
   </div>
 </div>
 
+<div class="compose-modal" id="accountModal" style="right:auto; left:40px;">
+  <div class="compose-header">
+    <span>Add account</span>
+    <span class="close" onclick="closeAccountModal()">✕</span>
+  </div>
+  <input type="text" id="acctLabel" placeholder="Display name (optional)">
+  <input type="text" id="acctEmail" placeholder="Email address">
+  <input type="password" id="acctPassword" placeholder="Password">
+  <input type="text" id="acctImapHost" placeholder="IMAP host">
+  <input type="number" id="acctImapPort" placeholder="IMAP port">
+  <input type="text" id="acctSmtpHost" placeholder="SMTP host">
+  <input type="number" id="acctSmtpPort" placeholder="SMTP port">
+  <div class="compose-footer">
+    <button class="send-btn" onclick="submitAddAccount()">Add account</button>
+    <span class="status-msg" id="accountStatus"></span>
+  </div>
+</div>
+
 <script>
 const API = '/api/email';
 const AUTH_API = '/api/auth';
-const DEFAULT_ADDRESS = 'test@mailcow.local';
+const ACCOUNTS_API = '/api/accounts';
 let currentFolder = 'inbox';
+let accounts = [];
+let currentAccountId = localStorage.getItem('currentAccountId') || null;
 
 function getToken() {
   return localStorage.getItem('token');
@@ -247,6 +268,7 @@ function getToken() {
 function authFetch(url, opts = {}) {
   const token = getToken();
   const headers = { ...(opts.headers || {}), Authorization: `Bearer ${token}` };
+  if (currentAccountId) headers['X-Account-Id'] = currentAccountId;
   return fetch(url, { ...opts, headers }).then((res) => {
     if (res.status === 401) {
       localStorage.removeItem('token');
@@ -256,14 +278,112 @@ function authFetch(url, opts = {}) {
   });
 }
 
+function currentAccount() {
+  return accounts.find((a) => a.id === currentAccountId) || null;
+}
+
+async function loadAccounts() {
+  const res = await authFetch(ACCOUNTS_API);
+  accounts = await res.json();
+
+  const switcher = document.getElementById('accountSwitcher');
+  switcher.innerHTML =
+    accounts.map((a) => `<option value="${a.id}">${escapeHtml(a.label)} (${escapeHtml(a.email)})</option>`).join('') +
+    '<option value="__add__">+ Add account…</option>';
+
+  if (!accounts.find((a) => a.id === currentAccountId)) {
+    currentAccountId = accounts[0] ? accounts[0].id : null;
+  }
+  if (currentAccountId) {
+    localStorage.setItem('currentAccountId', currentAccountId);
+    switcher.value = currentAccountId;
+  }
+
+  if (!accounts.length) {
+    openAccountModal();
+  }
+}
+
+function onAccountSwitcherChange(value) {
+  if (value === '__add__') {
+    document.getElementById('accountSwitcher').value = currentAccountId || '';
+    openAccountModal();
+    return;
+  }
+  currentAccountId = value;
+  localStorage.setItem('currentAccountId', currentAccountId);
+  loadCurrentFolder();
+}
+
+async function openAccountModal() {
+  document.getElementById('accountModal').classList.add('open');
+  document.getElementById('acctLabel').value = '';
+  document.getElementById('acctEmail').value = '';
+  document.getElementById('acctPassword').value = '';
+  document.getElementById('accountStatus').textContent = '';
+  try {
+    const res = await authFetch(`${ACCOUNTS_API}/defaults`);
+    const d = await res.json();
+    document.getElementById('acctImapHost').value = d.imapHost;
+    document.getElementById('acctImapPort').value = d.imapPort;
+    document.getElementById('acctSmtpHost').value = d.smtpHost;
+    document.getElementById('acctSmtpPort').value = d.smtpPort;
+  } catch (err) {
+    // defaults are just a convenience prefill; leave blank on failure
+  }
+}
+
+function closeAccountModal() {
+  document.getElementById('accountModal').classList.remove('open');
+}
+
+async function submitAddAccount() {
+  const payload = {
+    label: document.getElementById('acctLabel').value.trim(),
+    email: document.getElementById('acctEmail').value.trim(),
+    password: document.getElementById('acctPassword').value,
+    imapHost: document.getElementById('acctImapHost').value.trim(),
+    imapPort: Number(document.getElementById('acctImapPort').value),
+    smtpHost: document.getElementById('acctSmtpHost').value.trim(),
+    smtpPort: Number(document.getElementById('acctSmtpPort').value),
+  };
+  const status = document.getElementById('accountStatus');
+  status.textContent = 'Adding…';
+  status.className = 'status-msg';
+
+  try {
+    const res = await authFetch(ACCOUNTS_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok || data.success === false) {
+      status.textContent = 'Error: ' + (data.error || res.status);
+      status.className = 'status-msg error';
+      return;
+    }
+    currentAccountId = data.id;
+    localStorage.setItem('currentAccountId', currentAccountId);
+    closeAccountModal();
+    await loadAccounts();
+    renderFolderNav();
+    loadCurrentFolder();
+  } catch (err) {
+    status.textContent = 'Cannot reach API: ' + err.message;
+    status.className = 'status-msg error';
+  }
+}
+
 function showLogin() {
   document.getElementById('loginOverlay').style.display = 'flex';
   document.getElementById('appRoot').style.display = 'none';
 }
 
-function showApp() {
+async function showApp() {
   document.getElementById('loginOverlay').style.display = 'none';
   document.getElementById('appRoot').style.display = 'flex';
+  await loadAccounts();
   renderFolderNav();
   loadCurrentFolder();
 }
@@ -320,6 +440,11 @@ function selectFolder(key) {
 async function loadCurrentFolder() {
   const listView = document.getElementById('listView');
   listView.innerHTML = '<div class="empty-state">Loading...</div>';
+
+  if (!currentAccountId) {
+    listView.innerHTML = '<div class="empty-state">No account added yet. Use the account switcher (top right) to add one.</div>';
+    return;
+  }
 
   try {
     const res = await authFetch(`${API}/inbox?folder=${currentFolder}`);
@@ -398,9 +523,14 @@ async function deleteEmail(id) {
 }
 
 function openCompose() {
+  const account = currentAccount();
+  if (!account) {
+    openAccountModal();
+    return;
+  }
   document.getElementById('composeModal').classList.add('open');
-  document.getElementById('composeFrom').value = DEFAULT_ADDRESS;
-  document.getElementById('composeTo').value = DEFAULT_ADDRESS;
+  document.getElementById('composeFrom').value = account.email;
+  document.getElementById('composeTo').value = '';
   document.getElementById('composeSubject').value = '';
   document.getElementById('composeBody').value = '';
   document.getElementById('composeStatus').textContent = '';

@@ -6,6 +6,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const authRoutes = require('./routes/auth.routes');
 const emailRoutes = require('./routes/email.routes');
+const accountsRoutes = require('./routes/accounts.routes');
 
 const app = express();
 
@@ -35,6 +36,7 @@ const apiLimiter = rateLimit({
 app.use('/api', apiLimiter);
 
 app.use('/api/auth', authRoutes);
+app.use('/api/accounts', accountsRoutes);
 app.use('/api/email', emailRoutes);
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
