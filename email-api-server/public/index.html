@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Local Mail</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 14px;
+    color: #202124;
+    background: #f6f8fc;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    height: 56px;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    background: #fff;
+    border-bottom: 1px solid #e0e0e0;
+    gap: 12px;
+  }
+  header .logo { font-size: 20px; font-weight: 500; color: #5f6368; }
+  header input {
+    flex: 1;
+    max-width: 600px;
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: none;
+    background: #eaf1fb;
+    outline: none;
+  }
+  .body-wrap { flex: 1; display: flex; overflow: hidden; }
+  nav {
+    width: 220px;
+    background: #f6f8fc;
+    padding: 12px 8px;
+  }
+  .compose-btn {
+    background: #c2e7ff;
+    border: none;
+    border-radius: 16px;
+    padding: 14px 24px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.2);
+  }
+  .compose-btn:hover { background: #b3ddfa; }
+  .folder {
+    padding: 8px 20px;
+    border-radius: 0 16px 16px 0;
+    cursor: pointer;
+    color: #202124;
+    margin-bottom: 2px;
+  }
+  .folder:hover { background: #eaf1fb; }
+  .folder.active { background: #d3e3fd; font-weight: 600; }
+  main {
+    flex: 1;
+    background: #fff;
+    overflow-y: auto;
+    border-radius: 8px 0 0 0;
+  }
+  .toolbar {
+    padding: 10px 16px;
+    border-bottom: 1px solid #eee;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .toolbar button {
+    border: none;
+    background: none;
+    cursor: pointer;
+    padding: 6px 10px;
+    border-radius: 4px;
+    color: #5f6368;
+  }
+  .toolbar button:hover { background: #f1f3f4; }
+  .email-row {
+    display: flex;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid #f0f0f0;
+    cursor: pointer;
+    gap: 12px;
+  }
+  .email-row:hover { box-shadow: inset 1px 0 0 #dadce0, inset -1px 0 0 #dadce0, 0 1px 2px 0 rgba(60,64,67,.3); }
+  .email-row .from { width: 200px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .email-row .subject { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .email-row .date { width: 90px; text-align: right; color: #5f6368; font-size: 12px; }
+  .empty-state { padding: 40px; text-align: center; color: #5f6368; }
+
+  /* Reading pane */
+  .reading-pane { padding: 24px; }
+  .reading-pane h2 { margin-top: 0; }
+  .meta { color: #5f6368; margin-bottom: 16px; }
+  .back-btn { cursor: pointer; color: #5f6368; margin-bottom: 12px; display: inline-block; }
+  .body-text { white-space: pre-wrap; line-height: 1.5; }
+
+  /* Compose modal */
+  .compose-modal {
+    position: fixed;
+    bottom: 0;
+    right: 40px;
+    width: 500px;
+    background: #fff;
+    box-shadow: 0 0 12px rgba(0,0,0,.3);
+    border-radius: 8px 8px 0 0;
+    display: none;
+    flex-direction: column;
+  }
+  .compose-modal.open { display: flex; }
+  .compose-header {
+    background: #404040;
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 8px 8px 0 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .compose-header .close { cursor: pointer; }
+  .compose-modal input, .compose-modal textarea {
+    border: none;
+    border-bottom: 1px solid #eee;
+    padding: 10px 16px;
+    outline: none;
+    font-family: inherit;
+    font-size: 14px;
+  }
+  .compose-modal textarea { flex: 1; min-height: 200px; resize: vertical; border-bottom: none; }
+  .compose-footer {
+    padding: 10px 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .send-btn {
+    background: #0b57d0;
+    color: #fff;
+    border: none;
+    border-radius: 18px;
+    padding: 10px 24px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .send-btn:hover { background: #0a4bb8; }
+  .status-msg { font-size: 12px; color: #188038; }
+  .status-msg.error { color: #d93025; }
+
+  .login-overlay {
+    position: fixed;
+    inset: 0;
+    background: #f6f8fc;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .login-box {
+    background: #fff;
+    border: 1px solid #dadce0;
+    border-radius: 8px;
+    padding: 40px;
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .login-box h2 { margin: 0 0 8px; text-align: center; }
+  .login-box input {
+    padding: 10px 12px;
+    border: 1px solid #dadce0;
+    border-radius: 4px;
+    font-size: 14px;
+    outline: none;
+  }
+  .login-box input:focus { border-color: #0b57d0; }
+</style>
+</head>
+<body>
+
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <h2>Local Mail</h2>
+    <input type="text" id="loginUser" placeholder="Username" autocomplete="username">
+    <input type="password" id="loginPass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter') login()">
+    <button class="send-btn" onclick="login()">Log in</button>
+    <div class="status-msg error" id="loginError"></div>
+  </div>
+</div>
+
+<div id="appRoot" style="display:none; height:100vh; flex-direction:column;">
+  <header>
+    <div class="logo">Local Mail</div>
+    <input type="text" placeholder="Search mail (not implemented)" disabled>
+    <button onclick="logout()" style="border:none;background:none;cursor:pointer;color:#5f6368;">Log out</button>
+  </header>
+
+  <div class="body-wrap">
+    <nav>
+      <button class="compose-btn" onclick="openCompose()">✎ Compose</button>
+      <div id="folderList"></div>
+    </nav>
+
+    <main id="mainView">
+      <div class="toolbar">
+        <button onclick="loadCurrentFolder()">⟳ Refresh</button>
+        <span id="folderTitle" style="font-weight:600;">Inbox</span>
+      </div>
+      <div id="listView"></div>
+    </main>
+  </div>
+</div>
+
+<div class="compose-modal" id="composeModal">
+  <div class="compose-header">
+    <span>New Message</span>
+    <span class="close" onclick="closeCompose()">✕</span>
+  </div>
+  <input type="text" id="composeFrom" placeholder="From">
+  <input type="text" id="composeTo" placeholder="To">
+  <input type="text" id="composeSubject" placeholder="Subject">
+  <textarea id="composeBody" placeholder="Compose email"></textarea>
+  <div class="compose-footer">
+    <button class="send-btn" onclick="sendEmail()">Send</button>
+    <span class="status-msg" id="composeStatus"></span>
+  </div>
+</div>
+
+<script>
+const API = '/api/email';
+const AUTH_API = '/api/auth';
+const DEFAULT_ADDRESS = 'test@mailcow.local';
+let currentFolder = 'inbox';
+
+function getToken() {
+  return localStorage.getItem('token');
+}
+
+function authFetch(url, opts = {}) {
+  const token = getToken();
+  const headers = { ...(opts.headers || {}), Authorization: `Bearer ${token}` };
+  return fetch(url, { ...opts, headers }).then((res) => {
+    if (res.status === 401) {
+      localStorage.removeItem('token');
+      showLogin();
+    }
+    return res;
+  });
+}
+
+function showLogin() {
+  document.getElementById('loginOverlay').style.display = 'flex';
+  document.getElementById('appRoot').style.display = 'none';
+}
+
+function showApp() {
+  document.getElementById('loginOverlay').style.display = 'none';
+  document.getElementById('appRoot').style.display = 'flex';
+  renderFolderNav();
+  loadCurrentFolder();
+}
+
+async function login() {
+  const username = document.getElementById('loginUser').value.trim();
+  const password = document.getElementById('loginPass').value;
+  const errorEl = document.getElementById('loginError');
+  errorEl.textContent = '';
+  try {
+    const res = await fetch(`${AUTH_API}/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.success === false) {
+      errorEl.textContent = data.error || 'Login failed';
+      return;
+    }
+    localStorage.setItem('token', data.token);
+    showApp();
+  } catch (err) {
+    errorEl.textContent = 'Cannot reach API: ' + err.message;
+  }
+}
+
+function logout() {
+  localStorage.removeItem('token');
+  showLogin();
+}
+
+const FOLDERS = [
+  { key: 'inbox', label: 'Inbox' },
+  { key: 'sent', label: 'Sent' },
+  { key: 'drafts', label: 'Drafts' },
+  { key: 'trash', label: 'Trash' },
+];
+
+function renderFolderNav() {
+  const el = document.getElementById('folderList');
+  el.innerHTML = FOLDERS.map(f =>
+    `<div class="folder ${f.key === currentFolder ? 'active' : ''}" onclick="selectFolder('${f.key}')">${f.label}</div>`
+  ).join('');
+}
+
+function selectFolder(key) {
+  currentFolder = key;
+  renderFolderNav();
+  document.getElementById('folderTitle').textContent = FOLDERS.find(f => f.key === key).label;
+  loadCurrentFolder();
+}
+
+async function loadCurrentFolder() {
+  const listView = document.getElementById('listView');
+  listView.innerHTML = '<div class="empty-state">Loading...</div>';
+
+  try {
+    const res = await authFetch(`${API}/inbox?folder=${currentFolder}`);
+    const data = await res.json();
+    if (!res.ok || data.success === false) {
+      listView.innerHTML = `<div class="empty-state">Error loading inbox: ${data.error || res.status}</div>`;
+      return;
+    }
+    if (!data.length) {
+      listView.innerHTML = '<div class="empty-state">No messages</div>';
+      return;
+    }
+    listView.innerHTML = data.map(msg => `
+      <div class="email-row" onclick="openEmail('${msg.id}')">
+        <div class="from">${escapeHtml(msg.from)}</div>
+        <div class="subject">${escapeHtml(msg.subject)} — <span style="color:#5f6368;font-weight:400;">${escapeHtml((msg.body||'').slice(0,80))}</span></div>
+        <div class="date">${formatDate(msg.date)}</div>
+        <button onclick="event.stopPropagation(); deleteEmail('${msg.id}')" title="Delete">🗑</button>
+      </div>
+    `).join('');
+  } catch (err) {
+    listView.innerHTML = `<div class="empty-state">Cannot reach API: ${err.message}</div>`;
+  }
+}
+
+async function openEmail(id) {
+  const main = document.getElementById('mainView');
+  main.innerHTML = '<div class="reading-pane">Loading...</div>';
+  try {
+    const res = await authFetch(`${API}/${id}`);
+    const msg = await res.json();
+    if (!res.ok || msg.success === false) {
+      main.innerHTML = `<div class="reading-pane">Error: ${msg.error || res.status}</div>`;
+      return;
+    }
+    main.innerHTML = `
+      <div class="reading-pane">
+        <span class="back-btn" onclick="restoreListView()">&larr; Back to ${FOLDERS.find(f=>f.key===currentFolder).label}</span>
+        <h2>${escapeHtml(msg.subject)}</h2>
+        <div class="meta">
+          <div><b>From:</b> ${escapeHtml(msg.from)}</div>
+          <div><b>To:</b> ${escapeHtml(msg.to || '')}</div>
+          <div><b>Date:</b> ${formatDate(msg.date)}</div>
+        </div>
+        <div class="body-text">${escapeHtml(msg.body)}</div>
+      </div>
+    `;
+  } catch (err) {
+    main.innerHTML = `<div class="reading-pane">Cannot reach API: ${err.message}</div>`;
+  }
+}
+
+function restoreListView() {
+  document.getElementById('mainView').innerHTML = `
+    <div class="toolbar">
+      <button onclick="loadCurrentFolder()">⟳ Refresh</button>
+      <span id="folderTitle" style="font-weight:600;">${FOLDERS.find(f=>f.key===currentFolder).label}</span>
+    </div>
+    <div id="listView"></div>
+  `;
+  loadCurrentFolder();
+}
+
+async function deleteEmail(id) {
+  try {
+    const res = await authFetch(`${API}/${id}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok || data.success === false) {
+      alert('Delete failed: ' + (data.error || res.status));
+      return;
+    }
+    loadCurrentFolder();
+  } catch (err) {
+    alert('Cannot reach API: ' + err.message);
+  }
+}
+
+function openCompose() {
+  document.getElementById('composeModal').classList.add('open');
+  document.getElementById('composeFrom').value = DEFAULT_ADDRESS;
+  document.getElementById('composeTo').value = DEFAULT_ADDRESS;
+  document.getElementById('composeSubject').value = '';
+  document.getElementById('composeBody').value = '';
+  document.getElementById('composeStatus').textContent = '';
+}
+
+function closeCompose() {
+  document.getElementById('composeModal').classList.remove('open');
+}
+
+async function sendEmail() {
+  const from = document.getElementById('composeFrom').value.trim();
+  const to = document.getElementById('composeTo').value.trim();
+  const subject = document.getElementById('composeSubject').value.trim();
+  const body = document.getElementById('composeBody').value;
+  const status = document.getElementById('composeStatus');
+
+  if (!from || !to || !subject) {
+    status.textContent = 'from, to, subject required';
+    status.className = 'status-msg error';
+    return;
+  }
+
+  status.textContent = 'Sending...';
+  status.className = 'status-msg';
+
+  try {
+    const res = await authFetch(`${API}/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to, subject, body }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.success === false) {
+      status.textContent = 'Error: ' + (data.error || res.status);
+      status.className = 'status-msg error';
+      return;
+    }
+    status.textContent = 'Sent!';
+    setTimeout(() => {
+      closeCompose();
+      if (currentFolder === 'inbox') loadCurrentFolder();
+    }, 600);
+  } catch (err) {
+    status.textContent = 'Cannot reach API: ' + err.message;
+    status.className = 'status-msg error';
+  }
+}
+
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function formatDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+if (getToken()) {
+  showApp();
+} else {
+  showLogin();
+}
+</script>
+
+</body>
+</html>
