@@ -5,7 +5,8 @@ import { GoogleGenAI } from '@google/genai';
 import { PrismaService } from '@prisma/prisma.service';
 import { McpService } from '@module/mcp/mcp.service';
 import { HrToolsService, HrTool } from '@module/langchain/hr.tools';
-import { DB_SCHEMA, SYSTEM_PERSONA } from '@module/langchain/langchain.context';
+import { StoreToolsService, StoreTool } from '@module/langchain/store.tools';
+import { DB_SCHEMA, STORE_DB_SCHEMA, SYSTEM_PERSONA } from '@module/langchain/langchain.context';
 import { toMarkdownTable, formatCell } from '@module/langchain/langchain.markdown';
 import { LangchainQdrantService, QARating, AnswerSource } from '@module/langchain/langchain.qdrant';
 import { LangfuseService } from '@module/langchain/langfuse.service';
@@ -22,6 +23,53 @@ export class LangchainService {
   private readonly ollamaUrl = process.env.OLLAMA_URL ?? 'http://localhost:11434';
   private readonly ollamaModel = process.env.OLLAMA_MODEL ?? 'llama3.2';
 
+  // Lightweight per-session conversation state — NOT a framework state
+  // machine, just enough to resolve short follow-ups against the previous
+  // turn without re-deriving everything from rendered answer text (which can
+  // be phrased any way the LLM likes and is fundamentally unreliable to
+  // regex against). Two independent things tracked, both set once per turn
+  // from ask()'s single choke point / the tool-success sites below, read at
+  // the start of the NEXT turn:
+  //   - entity: WHO the last turn was about ("what's HER shift" after "who is
+  //     employee 3982" — resolvePronouns() reads this instead of the old
+  //     "Name (" text-regex, which stopped matching once narrateRows() started
+  //     returning free-form multi-field prose instead of that one legacy shape).
+  //   - intentTool/intentArgs: WHICH tool + args last answered a question, so a
+  //     follow-up with no pronoun at all ("what about last month?", "same for
+  //     the other department") can re-run the same tool with just the changed
+  //     arg instead of the router re-resolving from a bare fragment.
+  // In-memory, per-session, intentionally ephemeral (same durability class as
+  // LangchainQdrantService's `ensured` Set) — a lost entry on restart just
+  // falls back to the old history-scan/carry-forward behavior, never a hard
+  // failure. Not persisted across node-server restarts or multiple instances
+  // — move to Redis/DB if that ever matters.
+  private readonly sessionState = new Map<string, { entity?: string; intentTool?: string; intentArgs?: Record<string, any> }>();
+
+  // Stop/cancel support. Two mechanisms, because the two providers don't
+  // offer the same cancellation primitive:
+  //   - Ollama: a real AbortController per in-flight session, wired into the
+  //     axios request's `signal` (callOllama) — abort() actually kills the
+  //     HTTP request, so the model stops generating server-side too, not
+  //     just client-side rendering.
+  //   - Gemini (`@google/genai`): no exposed abort signal on
+  //     generateContentStream — `stopRequested` is checked once per chunk in
+  //     the for-await loop (narrateGemini) and breaks early. Best-effort:
+  //     stops US from consuming/emitting further chunks immediately, but
+  //     can't guarantee Google's own generation stops mid-flight.
+  // Both keyed by sessionId, both cleared at the start of each new turn
+  // (ask()) so a stop from a previous turn can never leak into a new one.
+  private readonly stopRequested = new Set<string>();
+  private readonly ollamaAbortControllers = new Map<string, AbortController>();
+
+  stopGeneration(sessionId: string): void {
+    this.stopRequested.add(sessionId);
+    this.ollamaAbortControllers.get(sessionId)?.abort();
+  }
+
+  private rememberIntent(sessionId: string, tool: string, args: Record<string, any>): void {
+    this.sessionState.set(sessionId, { ...this.sessionState.get(sessionId), intentTool: tool, intentArgs: args });
+  }
+
   // Explicit provider switch — MODEL=gemini routes SQL-gen/narration through
   // Gemini, anything else (including unset, or MODEL=ollama) uses Ollama.
   // GEMINI_API_KEY stays configured either way so flipping this back doesn't
@@ -35,8 +83,24 @@ export class LangchainService {
     private readonly mcp: McpService,
     private readonly qdrant: LangchainQdrantService,
     private readonly hrTools: HrToolsService,
+    private readonly storeTools: StoreToolsService,
     private readonly langfuse: LangfuseService,
   ) {}
+
+  private toolsFor(module: 'HRM' | 'STORE'): { tools: (HrTool | StoreTool)[]; findTool: (name: string) => HrTool | StoreTool | undefined } {
+    return module === 'STORE'
+      ? { tools: this.storeTools.tools, findTool: (name) => this.storeTools.findTool(name) }
+      : { tools: this.hrTools.tools, findTool: (name) => this.hrTools.findTool(name) };
+  }
+
+  /** A trained/rated tool call doesn't carry which module it was trained
+   * under — look it up across both tool sets by name (HR and Store tool
+   * names never collide by naming convention: get_employees vs get_products,
+   * etc.), so a replay works regardless of which module the question is
+   * asked in now. */
+  private findToolAnyModule(name: string): HrTool | StoreTool | undefined {
+    return this.hrTools.findTool(name) ?? this.storeTools.findTool(name);
+  }
 
   async fetchTodaySummary(shiftId?: number, requestToken?: string): Promise<any> {
     const url = `${this.laravelUrl}/api/hrm/analytics/today-summary${shiftId ? `?shift_id=${shiftId}` : ''}`;
@@ -86,12 +150,62 @@ export class LangchainService {
     trainMode = false,
     userName = 'Unknown',
     laravelToken?: string,
+    module: 'HRM' | 'STORE' = 'HRM',
   ): Promise<{ answer: string; data?: any; sql?: string; tool?: string; fromCache?: boolean }> {
+    // A stop from a PREVIOUS turn must never leak into this new one.
+    this.stopRequested.delete(sessionId);
     const result = await this.langfuse.runWithContext({ sessionId, userName, question }, () =>
-      this.askInternal(question, sessionId, trainMode, userName, laravelToken),
+      this.askInternal(question, sessionId, trainMode, userName, laravelToken, module),
     );
+    // A chart-worthy question ("attendance analytics for this year", "compare
+    // attendance this month vs last") can be answered via a live tool call
+    // (result.tool set, frontend's CHART_TOOLS map keys off it directly), a
+    // Qdrant cache hit replaying an OLD trained/rated SQL answer from before
+    // hr.tools.ts existed (result.tool is never set for a SQL source), or the
+    // SQL-gen fallback (same, no tool name). The frontend only ever draws a
+    // chart when `tool` is present, so any non-tool path silently lost the
+    // chart even though the row shape is identical either way. Infer the tool
+    // label from the shape of the actual rows returned, regardless of which
+    // stage produced them, rather than only trusting a live tool-router hit.
+    if (!result.tool) {
+      const inferred = this.inferChartTool(result.data);
+      if (inferred) result.tool = inferred;
+    }
+    const entity = this.extractEntityName(result.data);
+    if (entity) this.sessionState.set(sessionId, { ...this.sessionState.get(sessionId), entity });
+
     this.logConversationAsync(question, result, sessionId, userName);
     return result;
+  }
+
+  // Only person-shaped rows (first_name/last_name, or a full_name field) —
+  // deliberately NOT a generic 'name' field, which would just as happily
+  // match a department/product/supplier row and cache the wrong kind of
+  // entity as "the person the pronoun refers to". he/she/his/her/they/him/
+  // them always implies a PERSON, so scope stays exactly that narrow.
+  private extractEntityName(data: any): string | null {
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row || typeof row !== 'object') return null;
+    if (typeof row.full_name === 'string' && row.full_name.trim()) return row.full_name.trim();
+    if (typeof row.first_name === 'string' && row.first_name.trim()) {
+      return [row.first_name, row.last_name].filter(Boolean).join(' ').trim();
+    }
+    return null;
+  }
+
+  // Chart-worthy tool result shapes, keyed by the exact tool name the
+  // frontend's CHART_TOOLS map expects — see hr.tools.ts's
+  // getAttendanceAnalytics()/getAttendanceComparison() for the row shapes.
+  private static readonly CHART_SHAPES: { tool: string; keys: string[] }[] = [
+    { tool: 'get_attendance_analytics', keys: ['status', 'count'] },
+    { tool: 'get_attendance_comparison', keys: ['period', 'attendance_rate'] },
+  ];
+
+  private inferChartTool(rows: any): string | undefined {
+    if (!Array.isArray(rows) || rows.length === 0 || rows[0] == null || typeof rows[0] !== 'object') return undefined;
+    const rowKeys = new Set(Object.keys(rows[0]));
+    const shape = LangchainService.CHART_SHAPES.find((s) => s.keys.every((k) => rowKeys.has(k)));
+    return shape?.tool;
   }
 
   /** Fire-and-forget, same reasoning as saveHistoryAsync — the answer is
@@ -121,20 +235,21 @@ export class LangchainService {
     trainMode = false,
     userName = 'Unknown',
     laravelToken?: string,
+    module: 'HRM' | 'STORE' = 'HRM',
   ): Promise<{ answer: string; data?: any; sql?: string; tool?: string; fromCache?: boolean }> {
     await this.ensureSession(sessionId, question);
 
     // Greetings / small-talk — skip SQL pipeline entirely
     if (this.isConversational(question)) {
       const today = moment().format('YYYY-MM-DD');
-      const persona = SYSTEM_PERSONA.replace('{TODAY}', today).replace('{USER_NAME}', userName);
+      const persona = SYSTEM_PERSONA.replace('{TODAY}', today).replace('{USER_NAME}', userName).replace('{MODULE}', module);
       const answer = (await this.narrate(`${persona}\n\nUser: ${question}`, 'small_talk', sessionId)).trim();
       this.saveHistoryAsync(sessionId, question, answer);
       return { answer };
     }
 
-    // Today summary — fetch from Laravel HRM analytics API, fall through on failure
-    const isTodaySummaryQ = /today.{0,20}(summary|overview|report|stats|dashboard|attendance|present|absent|leave|shift)|what.{0,30}today|(summary|overview|report|stats).{0,20}today|^\s*total\s+attendance\b/i.test(question);
+    // Today summary — HRM-only concept, fetched from Laravel HRM analytics API, fall through on failure
+    const isTodaySummaryQ = module === 'HRM' && /today.{0,20}(summary|overview|report|stats|dashboard|attendance|present|absent|leave|shift)|what.{0,30}today|(summary|overview|report|stats).{0,20}today|^\s*total\s+attendance\b/i.test(question);
     if (!trainMode && isTodaySummaryQ) {
       const shiftMatch = question.match(/shift[_\s#]*(\d+)/i);
       const shiftId = shiftMatch ? parseInt(shiftMatch[1], 10) : undefined;
@@ -154,10 +269,10 @@ export class LangchainService {
 
     // Pronoun resolution — replace he/she/his/her with last mentioned employee from history
     const history = await this.loadHistory(sessionId);
-    const resolvedQuestion = this.resolvePronouns(selfResolvedQuestion, history);
+    const resolvedQuestion = this.resolvePronouns(selfResolvedQuestion, history, sessionId);
 
     const today = moment().format('YYYY-MM-DD');
-    const schema = DB_SCHEMA.replace('{TODAY}', today).replace('{USER_NAME}', userName);
+    const schema = (module === 'STORE' ? STORE_DB_SCHEMA : DB_SCHEMA).replace('{TODAY}', today).replace('{USER_NAME}', userName);
 
     // If not training: check Qdrant for a semantically-similar approved query first.
     // resolvedQuestion carries conversation state (pronoun resolution against the
@@ -176,23 +291,16 @@ export class LangchainService {
             if (replayed) {
               const answer = await this.narrateRows(question, replayed.rows, sessionId, trained.instruction || undefined);
               this.saveHistoryAsync(sessionId, question, answer);
+              this.rememberIntent(sessionId, trained.tool, replayed.args);
               return { answer, data: replayed.rows, tool: trained.tool, fromCache: true };
             }
             // Tool replay failed (schema drift, bad args) — fall through to SQL/AI below.
           } else if (!trained.sql) {
             // Non-SQL, non-tool answers (greetings, "what is my name", today-summary
             // text) can be trained too — no query to re-run, just replay the saved answer.
-            // Unlike the SQL/tool branches there's no args JSON to adapt or re-check
-            // against the live question, so a below-HIGH_CONFIDENCE_SCORE match must
-            // NOT be trusted at all (falls through instead) — a lower-similarity "hit"
-            // here was previously replayed verbatim regardless of score, letting a
-            // mistrained entry (e.g. question about one employee, saved answer about
-            // another) leak into unrelated questions.
-            if (trained.score >= LangchainService.HIGH_CONFIDENCE_SCORE) {
-              const answer = trained.answer || 'No cached answer available.';
-              this.saveHistoryAsync(sessionId, question, answer);
-              return { answer, fromCache: true };
-            }
+            const answer = trained.answer || 'No cached answer available.';
+            this.saveHistoryAsync(sessionId, question, answer);
+            return { answer, fromCache: true };
           } else {
             const sqlToRun = trained.score >= LangchainService.HIGH_CONFIDENCE_SCORE
               ? trained.sql
@@ -219,15 +327,12 @@ export class LangchainService {
             if (replayed) {
               const answer = await this.narrateRows(question, replayed.rows, sessionId);
               this.saveHistoryAsync(sessionId, question, answer);
+              this.rememberIntent(sessionId, qa.tool, replayed.args);
               return { answer, data: replayed.rows, tool: qa.tool, fromCache: true };
             }
           } else if (!qa.sql) {
-            // Same reasoning as the trained-answer branch above — a rated Q&A text
-            // answer has no args to adapt, so only trust it verbatim at high confidence.
-            if (qa.score >= LangchainService.HIGH_CONFIDENCE_SCORE) {
-              this.saveHistoryAsync(sessionId, question, qa.answer);
-              return { answer: qa.answer, fromCache: true };
-            }
+            this.saveHistoryAsync(sessionId, question, qa.answer);
+            return { answer: qa.answer, fromCache: true };
           } else {
             const sqlToRun = qa.score >= LangchainService.HIGH_CONFIDENCE_SCORE
               ? qa.sql
@@ -256,10 +361,11 @@ export class LangchainService {
     // rest of this pipeline (not the provider's native function-calling API) —
     // see the note below on why native tool-calling was dropped for SQL-gen.
     if (!trainMode) {
-      const toolResult = await this.tryHrTool(resolvedQuestion, today);
+      const toolResult = await this.tryModuleTool(resolvedQuestion, today, module, historyContext, sessionId);
       if (toolResult) {
         const answer = await this.narrateRows(question, toolResult.rows, sessionId);
         this.saveHistoryAsync(sessionId, question, answer);
+        this.rememberIntent(sessionId, toolResult.tool, toolResult.args);
 
         if (process.env.TRAIN_MODE === 'true') {
           socketService.emit('langchain:validate', { question, tool: toolResult.tool, args: toolResult.args, answer });
@@ -448,11 +554,23 @@ export class LangchainService {
     return result;
   }
 
-  private resolvePronouns(question: string, history: { role: string; content: string }[]): string {
+  private resolvePronouns(question: string, history: { role: string; content: string }[], sessionId: string): string {
     const hasPronouns = /\b(he|she|his|her|him|they|their|them)\b/i.test(question);
     if (!hasPronouns) return question;
 
-    // Scan assistant messages in reverse for a known employee name (First Last pattern)
+    // Preferred source — the actual entity extracted from the previous
+    // turn's ROW DATA (see extractEntityName/ask()), not re-derived from
+    // whatever prose the LLM happened to phrase the answer in.
+    const cachedEntity = this.sessionState.get(sessionId)?.entity;
+    if (cachedEntity) {
+      return question
+        .replace(/\b(his|her|their)\b/gi, `${cachedEntity}'s`)
+        .replace(/\b(he|she|they|him|them)\b/gi, cachedEntity);
+    }
+
+    // Fallback — scan assistant messages in reverse for a known employee name
+    // (legacy "Name (" narration pattern; kept in case some older cached
+    // answer or a future narration style still matches it).
     const namePattern = /^([A-Z][a-z]+(?: [A-Z][a-z.]+){1,3})\s*\(/;
     for (let i = history.length - 1; i >= 0; i--) {
       if (history[i].role !== 'assistant') continue;
@@ -489,6 +607,9 @@ export class LangchainService {
       /^(who are you|what are you|what can you do)\??$/i,
       /^what is (your name|my name)\??$/i,
       /^(tell me about (this|the) company|what (is|does) (this|the) company( do)?|who (are|is) (we|this company)|about (this|the) company)\??$/i,
+      // Personal/human-interaction questions directed at the assistant itself —
+      // no HRM/STORE data involved, answered from persona/personality, not SQL/tools.
+      /^(do you (like|love) me|do you have (feelings|emotions)|are you (human|a robot|a bot|alive|real|sentient|conscious)|can (we|you) be friends|do you get (tired|bored|sad|happy)|what.?s your name|who made you|who created you|are you (an ai|artificial intelligence)|do you (sleep|dream|eat)|are you single|will you marry me|i love you|you.?re (funny|smart|cute|nice|helpful|the best|amazing|great))[\s!.?]*$/i,
     ];
     return patterns.some((p) => p.test(trimmed));
   }
@@ -531,10 +652,15 @@ Money amounts are in BDT (Bangladeshi Taka) — write them as "BDT 2,400", never
   }
 
   /**
-   * Plain-prompt tool router for HR questions — asks the model to pick one of
-   * hr.tools.ts's fixed tools (by name) and its arguments, given only the tool
-   * manifest (name/description/param names), then calls it directly via Prisma.
-   * No SQL is generated or run for anything this resolves.
+   * Plain-prompt tool router — asks the model to pick one of the CURRENT
+   * MODULE's fixed tools (hr.tools.ts for HRM, store.tools.ts for STORE) by
+   * name and its arguments, given only that module's tool manifest
+   * (name/description/param names), then calls it directly via Prisma. No SQL
+   * is generated or run for anything this resolves. Scoping the manifest to
+   * one module keeps the router prompt small AND stops it "finding" the wrong
+   * module's tool for an ambiguous question (e.g. "status" existing on both
+   * HR leave requests and Store purchase requisitions) — the frontend's
+   * module dropdown decides which tool set is even offered.
    *
    * Deliberately NOT the provider's native function-calling/tool-choice API —
    * that was tried for this same pipeline (see askViaLLM's SQL-gen path) and
@@ -545,19 +671,33 @@ Money amounts are in BDT (Bangladeshi Taka) — write them as "BDT 2,400", never
    * predictable, and any failure to parse/validate/match just falls through to
    * the SQL pipeline below rather than erroring the whole question out.
    */
-  private async tryHrTool(question: string, today: string): Promise<{ tool: string; args: Record<string, any>; rows: any[] } | null> {
-    const manifest = this.hrTools.tools
+  private async tryModuleTool(question: string, today: string, module: 'HRM' | 'STORE', historyContext: string, sessionId: string): Promise<{ tool: string; args: Record<string, any>; rows: any[] } | null> {
+    const { tools, findTool } = this.toolsFor(module);
+    const manifest = tools
       .map((t) => `- ${t.name}(${Object.keys((t.schema as any).shape ?? {}).join(', ')}): ${t.description}`)
       .join('\n');
 
-    const prompt = `You are a router that decides whether a user's question can be answered by one of these fixed HR tools:
+    // Explicit structured hint (on top of the free-text historyContext) —
+    // the last tool+args that actually answered a question in this session,
+    // so a follow-up with NO pronoun and NO explicit subject at all ("what
+    // about last month?", "same for the other department") can be resolved
+    // as "re-run that same tool, just change this one arg" instead of the
+    // router trying to re-derive everything from a bare fragment.
+    const lastIntent = this.sessionState.get(sessionId);
+    const intentHint = lastIntent?.intentTool
+      ? `\nLast tool call that answered a question in this conversation: ${lastIntent.intentTool}(${JSON.stringify(lastIntent.intentArgs ?? {})}). If the current question is a bare follow-up with no clear subject of its own, assume it means "run that same tool again with only what changed" and merge accordingly.\n`
+      : '';
+
+    const prompt = `You are a router that decides whether a user's question can be answered by one of these fixed ${module} tools:
 ${manifest}
 
 Today's date is ${today}. Every tool here uses from_date/to_date (or joined_after/joined_before) date-range args, never a bare month/year — always compute concrete YYYY-MM-DD values yourself for any period phrasing, never leave them empty (that silently defaults to the current period, which is wrong). Two different phrasings need two different calculations, at whatever granularity (month OR year) the question names:
 1. A NAMED period ("July", "in March", "for June", "2025", "in the year 2024") — use that calendar period's own full boundaries: from_date = 1st day of that month/year, to_date = last day of that month/year (Dec 31 for a named year).
 2. A relative, unnamed period ("last month", "one month", "last N months", "this month", "this year", "last year") — this is a ROLLING or to-date window, NOT a fixed prior calendar period. "This month"/"this year" = from_date = 1st of the current month/year, to_date = today. "Last month"/"one month" = from_date = today minus 1 month, to_date = today. "Last year"/"one year" = from_date = today minus 1 year, to_date = today. "Last N months/years" = from_date = today minus N months/years, to_date = today.
-
+${historyContext}${intentHint}
 User question: "${question}"
+
+The question may be a short follow-up that only makes sense given the conversation above (e.g. "and her department?", "what about last month?", "same for the other one") — use the conversation history to fill in the missing subject/period/filter in your chosen tool's args, don't just treat the bare fragment in isolation.
 
 If one of the tools above can answer this, reply with ONLY a single-line JSON object of the exact shape {"tool": "<tool_name>", "args": { ... }} — args must only use the parameter names listed for that tool, and can be omitted/empty if none apply.
 If none of the tools fit — the question needs a table/relationship none of them cover (salary details, side bills, holiday swaps, promotion configs, notice read/ack tracking, face IDs, shift overrides, etc.) — reply with exactly: NONE
@@ -565,9 +705,9 @@ No markdown, no explanation, no code fences — just the JSON object or the word
 
     let raw: string;
     try {
-      raw = (await this.narrate(prompt, 'hr_tool_router')).trim();
+      raw = (await this.narrate(prompt, 'module_tool_router')).trim();
     } catch (err: any) {
-      this.logger.warn('HR tool router prompt failed, falling through to SQL', err?.message);
+      this.logger.warn('Tool router prompt failed, falling through to SQL', err?.message);
       return null;
     }
 
@@ -582,7 +722,7 @@ No markdown, no explanation, no code fences — just the JSON object or the word
     }
 
     if (!parsed.tool) return null;
-    const tool = this.hrTools.findTool(parsed.tool);
+    const tool = findTool(parsed.tool);
     if (!tool) return null;
 
     try {
@@ -596,45 +736,33 @@ No markdown, no explanation, no code fences — just the JSON object or the word
       const rows = Array.isArray(result) ? result : result == null ? [] : [result];
       return { tool: tool.name, args, rows };
     } catch (err: any) {
-      this.logger.warn(`HR tool "${parsed.tool}" args invalid or execution failed, falling through to SQL`, err?.message);
+      this.logger.warn(`Tool "${parsed.tool}" args invalid or execution failed, falling through to SQL`, err?.message);
       return null;
     }
   }
 
   /**
    * Replays a trained/rated tool-based answer source. At/above HIGH_CONFIDENCE_SCORE
-   * the saved args are normally reused verbatim (same trust rule as adaptReferenceSql's
-   * SQL path) — EXCEPT when a saved string arg's literal value isn't found anywhere in
-   * the current question (see hasStaleArgValue below), which forces adaptation
-   * regardless of score. This was a real bug, not a hypothetical: "show me payroll of
-   * arif" scored >=0.92 against a trained "show me payroll of shihab" call and replayed
-   * employee_name="shihab" verbatim — embeddings don't reliably distinguish proper
-   * nouns, so a near-identical template score does NOT mean the entity named is the
-   * same. The same staleness risk applies to any literal date/status/etc. baked into a
-   * cached call, so the check is generic (any string arg), not name-specific.
+   * the saved args are reused verbatim (same trust rule as adaptReferenceSql's SQL
+   * path). Below it, the args are close enough to be relevant but the question may
+   * differ in a specific value (different name/month/status/etc.) — the LLM is asked
+   * to adapt just the args JSON to the actual question, validated against the tool's
+   * zod schema before use. Any failure (unknown tool, invalid args, handler error)
+   * returns null so the caller falls through to the SQL/AI pipeline.
    */
-  private hasStaleArgValue(args: Record<string, any> | undefined, question: string): boolean {
-    if (!args) return false;
-    const lowerQuestion = question.toLowerCase();
-    return Object.values(args).some(
-      (v) => typeof v === 'string' && v.trim() !== '' && !lowerQuestion.includes(v.trim().toLowerCase()),
-    );
-  }
-
   private async replayTrainedTool(
     toolName: string,
     trainedArgs: Record<string, any> | undefined,
     question: string,
     referenceQuestion: string,
     score: number,
-  ): Promise<{ rows: any[] } | null> {
-    const tool = this.hrTools.findTool(toolName);
+  ): Promise<{ rows: any[]; args: Record<string, any> } | null> {
+    const tool = this.findToolAnyModule(toolName);
     if (!tool) return null;
 
     try {
       let args = trainedArgs ?? {};
-      const sameQuestion = referenceQuestion.trim().toLowerCase() === question.trim().toLowerCase();
-      if (!sameQuestion && (score < LangchainService.HIGH_CONFIDENCE_SCORE || this.hasStaleArgValue(trainedArgs, question))) {
+      if (score < LangchainService.HIGH_CONFIDENCE_SCORE && referenceQuestion.trim().toLowerCase() !== question.trim().toLowerCase()) {
         args = await this.adaptReferenceToolArgs(tool, referenceQuestion, trainedArgs ?? {}, question);
       }
       const parsedArgs = tool.schema.parse(args) as Record<string, any>;
@@ -645,7 +773,7 @@ No markdown, no explanation, no code fences — just the JSON object or the word
       // narrateRows()'s Object.keys(rows[0]) crashed on that. Treat a
       // nullish single result as "no rows", not a row containing nothing.
       const rows = Array.isArray(result) ? result : result == null ? [] : [result];
-      return { rows };
+      return { rows, args: parsedArgs };
     } catch (err: any) {
       this.logger.warn(`Trained tool "${toolName}" replay failed, falling through`, err?.message);
       return null;
@@ -654,7 +782,7 @@ No markdown, no explanation, no code fences — just the JSON object or the word
 
   /** Same idea as adaptReferenceSql, but for a tool's args JSON instead of raw SQL. */
   private async adaptReferenceToolArgs(
-    tool: HrTool,
+    tool: HrTool | StoreTool,
     referenceQuestion: string,
     referenceArgs: Record<string, any>,
     question: string,
@@ -718,7 +846,14 @@ Return ONLY the raw SQL query. No markdown, no explanation, no code blocks.`;
   // case and ISO-date-string formatting identically in both single-row and
   // multi-row answers, one implementation instead of two drifting copies.
   private formatAggregateValue(value: any): string {
+    // A single-row aggregate answer renders as "Key: value, Key: value" prose
+    // — an empty/whitespace-only string (e.g. religion = '' in the DB, not
+    // NULL) leaves a trailing "Religion: " with nothing after the colon,
+    // reading as broken. A blank table CELL (formatCell, multi-row path)
+    // is normal/expected — this fallback is deliberately scoped to just this
+    // inline single-row format, not applied to formatCell itself.
     if (value == null) return 'N/A';
+    if (typeof value === 'string' && value.trim() === '') return 'N/A';
     return formatCell(value);
   }
 
@@ -769,7 +904,7 @@ Return ONLY the raw SQL query. No markdown, no explanation, no code blocks.`;
       ? (chunk: string) => socketService.emit('langchain:stream', { session_id: streamSessionId, chunk })
       : undefined;
     try {
-      const output = this.hasGemini ? await this.narrateGemini(prompt, onChunk) : await this.callOllama(prompt, onChunk);
+      const output = this.hasGemini ? await this.narrateGemini(prompt, onChunk, streamSessionId) : await this.callOllama(prompt, onChunk, streamSessionId);
       this.langfuse.logGeneration({ name, input: prompt, output, model, startTime, endTime: new Date() });
       return output;
     } catch (err: any) {
@@ -786,7 +921,7 @@ Return ONLY the raw SQL query. No markdown, no explanation, no code blocks.`;
     }
   }
 
-  private async narrateGemini(prompt: string, onChunk?: (chunk: string) => void): Promise<string> {
+  private async narrateGemini(prompt: string, onChunk?: (chunk: string) => void, sessionId?: string): Promise<string> {
     if (!onChunk) {
       const response = await this.genai.models.generateContent({
         model: GEMINI_TEXT_MODEL,
@@ -801,6 +936,11 @@ Return ONLY the raw SQL query. No markdown, no explanation, no code blocks.`;
     });
     let full = '';
     for await (const part of stream) {
+      // @google/genai's generateContentStream has no exposed abort signal —
+      // this is the best cancellation available: stop consuming/emitting
+      // further chunks the instant a stop is requested, even though Google's
+      // own generation may keep running server-side until the stream ends.
+      if (sessionId && this.stopRequested.has(sessionId)) break;
       const delta = part.text ?? '';
       if (delta) {
         full += delta;
@@ -828,6 +968,8 @@ Write a single SELECT SQL query to answer this question: "${question}"
 Rules:
 - Only SELECT statements. No INSERT, UPDATE, DELETE, DROP.
 - Use proper JOINs when needed.
+- Never use SELECT * — always list only the specific columns needed to answer the question.
+- Never select deleted_at, created_at, or updated_at unless the question explicitly asks about creation/update/deletion time — these are internal bookkeeping columns, not useful data for the user.
 - Limit results to 100 rows max.
 - Return ONLY the raw SQL query. No markdown, no explanation, no code blocks.`;
 
@@ -870,74 +1012,97 @@ Fix the SQL and return ONLY the corrected raw SQL query.`;
     return { sql, rows, answer };
   }
 
-  private async callOllama(prompt: string, onChunk?: (chunk: string) => void): Promise<string> {
-    const response = await axios.post(
-      `${this.ollamaUrl}/api/chat`,
-      {
-        model: this.ollamaModel,
-        // Always streamed at the transport level (NDJSON lines from Ollama) —
-        // onChunk is only wired up to actually forward deltas to the frontend
-        // for user-facing answer generations (see narrate()'s streamSessionId);
-        // internal SQL/JSON generations still just accumulate silently and
-        // return the full string, same contract as before.
-        stream: true,
-        // qwen3:8b is a reasoning model — Ollama splits its output into an
-        // invisible `thinking` (chain-of-thought) block and the actual
-        // `content`. With num_predict capped at 512 and thinking left on, the
-        // model was still mid-<think> when the token budget ran out on every
-        // single request — 100% of the 512 tokens went to reasoning, 0 to the
-        // actual SQL/answer, so `content` came back empty regardless of the
-        // question ("Only read queries are allowed." on everything). Disabling
-        // thinking skips straight to the answer — verified: ~136 tokens, ~8s,
-        // correct SQL, for a query that previously always returned empty.
-        think: false,
-        messages: [{ role: 'user', content: prompt }],
-        // keep_alive: model stays resident in memory between requests instead of
-        // Ollama's default ~5min idle-unload — reloading a multi-GB model is the
-        // single biggest local-inference latency spike, easily several seconds.
-        keep_alive: '30m',
-        // SQL/narration answers are always short — capping generation length
-        // stops the model from running on past a useful answer.
-        //
-        // num_ctx: qwen3:8b's Modelfile sets no num_ctx, so Ollama silently
-        // defaulted every request here to its runtime default of 2048 tokens.
-        // DB_SCHEMA alone is ~15KB (several thousand tokens) — every SQL-gen
-        // prompt (schema + persona + conversation history + question) was
-        // overflowing that window and getting truncated before the model ever
-        // saw the full schema, causing empty/garbled completions for anything
-        // not already cached in Qdrant. qwen3:8b supports up to 40960 — 8192
-        // comfortably covers this prompt's actual size with headroom to spare.
-        options: { num_predict: 512, num_ctx: 8192 },
-      },
-      { timeout: 60000, responseType: 'stream' },
-    );
+  private async callOllama(prompt: string, onChunk?: (chunk: string) => void, sessionId?: string): Promise<string> {
+    const controller = new AbortController();
+    if (sessionId) this.ollamaAbortControllers.set(sessionId, controller);
 
-    return new Promise<string>((resolve, reject) => {
-      let full = '';
-      let buffer = '';
-      response.data.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          let obj: any;
-          try {
-            obj = JSON.parse(trimmed);
-          } catch {
-            continue; // shouldn't happen (NDJSON is line-delimited), skip defensively
+    try {
+      const response = await axios.post(
+        `${this.ollamaUrl}/api/chat`,
+        {
+          model: this.ollamaModel,
+          // Always streamed at the transport level (NDJSON lines from Ollama) —
+          // onChunk is only wired up to actually forward deltas to the frontend
+          // for user-facing answer generations (see narrate()'s streamSessionId);
+          // internal SQL/JSON generations still just accumulate silently and
+          // return the full string, same contract as before.
+          stream: true,
+          // qwen3:8b is a reasoning model — Ollama splits its output into an
+          // invisible `thinking` (chain-of-thought) block and the actual
+          // `content`. With num_predict capped at 512 and thinking left on, the
+          // model was still mid-<think> when the token budget ran out on every
+          // single request — 100% of the 512 tokens went to reasoning, 0 to the
+          // actual SQL/answer, so `content` came back empty regardless of the
+          // question ("Only read queries are allowed." on everything). Disabling
+          // thinking skips straight to the answer — verified: ~136 tokens, ~8s,
+          // correct SQL, for a query that previously always returned empty.
+          think: false,
+          messages: [{ role: 'user', content: prompt }],
+          // keep_alive: model stays resident in memory between requests instead of
+          // Ollama's default ~5min idle-unload — reloading a multi-GB model is the
+          // single biggest local-inference latency spike, easily several seconds.
+          keep_alive: '30m',
+          // SQL/narration answers are always short — capping generation length
+          // stops the model from running on past a useful answer.
+          //
+          // num_ctx: qwen3:8b's Modelfile sets no num_ctx, so Ollama silently
+          // defaulted every request here to its runtime default of 2048 tokens.
+          // DB_SCHEMA alone is ~15KB (several thousand tokens) — every SQL-gen
+          // prompt (schema + persona + conversation history + question) was
+          // overflowing that window and getting truncated before the model ever
+          // saw the full schema, causing empty/garbled completions for anything
+          // not already cached in Qdrant. qwen3:8b supports up to 40960 — 8192
+          // comfortably covers this prompt's actual size with headroom to spare.
+          options: { num_predict: 512, num_ctx: 8192 },
+        },
+        { timeout: 60000, responseType: 'stream', signal: controller.signal },
+      );
+
+      return await new Promise<string>((resolve, reject) => {
+        let full = '';
+        let buffer = '';
+        response.data.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let obj: any;
+            try {
+              obj = JSON.parse(trimmed);
+            } catch {
+              continue; // shouldn't happen (NDJSON is line-delimited), skip defensively
+            }
+            const delta: string = obj?.message?.content ?? '';
+            if (delta) {
+              full += delta;
+              onChunk?.(delta);
+            }
           }
-          const delta: string = obj?.message?.content ?? '';
-          if (delta) {
-            full += delta;
-            onChunk?.(delta);
-          }
-        }
+        });
+        response.data.on('end', () => resolve(full));
+        // An abort() call while the stream is in flight ends up here, not as
+        // a rejection of the outer axios.post() promise — resolve with
+        // whatever was generated before the stop instead of surfacing it as
+        // a hard failure (askInternal would otherwise record this as a
+        // failed query and show a generic error to the user for what was
+        // actually just a user-requested stop).
+        response.data.on('error', (err: any) => {
+          if (axios.isCancel(err) || err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') resolve(full);
+          else reject(err);
+        });
       });
-      response.data.on('end', () => resolve(full));
-      response.data.on('error', reject);
-    });
+    } catch (err: any) {
+      // Aborted before the initial response ever arrived (e.g. stopped
+      // during the connection/prompt-eval phase, before any token streamed)
+      // — nothing was generated yet, so an empty string is the right answer,
+      // not a thrown error surfaced to the user as a failure.
+      if (axios.isCancel(err) || err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError') return '';
+      throw err;
+    } finally {
+      if (sessionId) this.ollamaAbortControllers.delete(sessionId);
+    }
   }
 
   private extractSQL(raw: string): string {
@@ -963,6 +1128,13 @@ Fix the SQL and return ONLY the corrected raw SQL query.`;
       for (const [k, v] of Object.entries(row)) {
         if (typeof v === 'bigint') out[k] = Number(v);
         else if (v instanceof Date) out[k] = v.toISOString();
+        // DECIMAL columns from a raw SQL query come back as Prisma Decimal
+        // instances, not plain numbers — same gap serializeBigInt() (the tool
+        // path) already covers via .toNumber(), but this SQL-gen path never
+        // unwrapped them. An un-unwrapped Decimal reaching toMarkdownTable's
+        // formatCell() risks rendering as raw object noise (or worse, if any
+        // downstream code treats it as a function reference).
+        else if (v != null && typeof v === 'object' && typeof (v as any).toNumber === 'function') out[k] = (v as any).toNumber();
         else out[k] = v;
       }
       return out;

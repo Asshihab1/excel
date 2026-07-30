@@ -1,29 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '@prisma/prisma.service';
 import { z } from 'zod';
+import { serializeBigInt } from '@module/langchain/langchain.util';
 
 export interface HrTool {
   name: string;
   description: string;
   schema: z.ZodTypeAny;
   handler: (args: any) => Promise<any>;
-}
-
-// Prisma returns BigInt for unsigned-bigint columns (ids, fk's) and Decimal
-// objects for money columns — neither is JSON-serializable as-is, so every
-// tool result is run through this before it reaches the LLM/HTTP layer.
-function serializeBigInt(value: any): any {
-  if (value === null || value === undefined) return value;
-  if (typeof value === 'bigint') return Number(value);
-  if (value instanceof Date) return value.toISOString();
-  if (Array.isArray(value)) return value.map(serializeBigInt);
-  if (typeof value === 'object') {
-    if (typeof value.toNumber === 'function') return value.toNumber(); // Prisma Decimal
-    const out: Record<string, any> = {};
-    for (const key of Object.keys(value)) out[key] = serializeBigInt(value[key]);
-    return out;
-  }
-  return value;
 }
 
 const EMPLOYEE_SELECT = {
@@ -123,7 +107,11 @@ export class HrToolsService {
         ],
       };
     }
-    if (opts.status) where.status = opts.status;
+    // attendance_logs.status only ever holds 'VALID'/'INVALID' (see the note
+    // above attendanceBreakdown below) — normalize whatever case the router
+    // emits ("valid", "Valid", "VALID") to the exact stored value instead of
+    // silently matching zero rows on a case mismatch.
+    if (opts.status) where.status = opts.status.toUpperCase();
     if (opts.date) {
       where.attendance_date = new Date(opts.date);
     } else if (opts.from_date || opts.to_date) {
@@ -353,6 +341,28 @@ export class HrToolsService {
       ...fallback,
       note: `No bonuses found for ${this.formatDate(from)} to ${this.formatDate(to)} yet — showing the most recent period with bonus records (${this.formatDate(latestMonthStart)} to ${this.formatDate(latestMonthEnd)}) instead.`,
     };
+  }
+
+  // ─── Salary Structure ───────────────────────────────────────────────────
+
+  // employee_salaries.total_salary is the CONFIGURED base salary structure
+  // per employee (title/basic/house_rent/allowances) — distinct from
+  // payrolls.net_salary/gross_salary, which is a specific MONTH's actual
+  // payroll run. "Is there any employee salary below X"/"who earns less
+  // than X" means this table, not a payroll period.
+  async getEmployeesBelowSalary(opts: { max_salary: number; limit?: number }): Promise<any[]> {
+    const rows = await this.prisma.employee_salaries.findMany({
+      where: { total_salary: { lt: opts.max_salary } },
+      select: {
+        title: true,
+        total_salary: true,
+        basic: true,
+        employees: { select: { first_name: true, last_name: true, employee_no: true, department: true, designation: true } },
+      },
+      take: opts.limit ?? 50,
+      orderBy: { total_salary: 'asc' },
+    });
+    return serializeBigInt(rows);
   }
 
   // ─── Payroll ────────────────────────────────────────────────────────────
@@ -897,13 +907,13 @@ export class HrToolsService {
       },
       {
         name: 'get_attendance',
-        description: 'Get attendance log entries, optionally filtered by employee name, a single date, a date range, or status (present/absent/late).',
+        description: 'Get attendance log entries, optionally filtered by employee name, a single date, a date range, or status. The status column only ever holds VALID (a real attendance record exists) or INVALID — there is NO "present"/"absent"/"late" status value. For "present"/"attended" questions pass status="VALID"; there is no "absent" status to filter by (absent = no VALID log — leave status empty and reason about it from the answer instead); for "late" do NOT pass status at all (lateness isn\'t a stored status — use get_today_attendance_counts or get_attendance_analytics for present/absent/late breakdowns instead of this tool).',
         schema: z.object({
           employee_name: z.string().optional(),
           date: z.string().optional().describe('YYYY-MM-DD'),
           from_date: z.string().optional().describe('YYYY-MM-DD'),
           to_date: z.string().optional().describe('YYYY-MM-DD'),
-          status: z.string().optional(),
+          status: z.string().optional().describe('VALID or INVALID — the only two real values in the database'),
           limit: z.number().optional(),
         }),
         handler: (args) => this.getAttendance(args),
@@ -946,6 +956,15 @@ export class HrToolsService {
         description: 'List all configured leave types and their annual day allowance.',
         schema: z.object({}),
         handler: () => this.getLeaveTypes(),
+      },
+      {
+        name: 'get_employees_below_salary',
+        description: 'List employees whose CONFIGURED base salary structure (employee_salaries.total_salary) is below a given threshold — NOT a specific month\'s payroll run (use get_payroll_summary/get_payroll_totals for that). Use for "is there any employee salary below X"/"who earns less than X"/"employees under X salary" questions. Convert shorthand like "7k" to 7000 yourself.',
+        schema: z.object({
+          max_salary: z.number().describe('Employees with total_salary strictly less than this are returned'),
+          limit: z.number().optional(),
+        }),
+        handler: (args) => this.getEmployeesBelowSalary(args),
       },
       {
         name: 'get_payroll_summary',

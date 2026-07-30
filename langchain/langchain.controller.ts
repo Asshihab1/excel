@@ -7,18 +7,29 @@ export class LangchainController {
 
   @Post('ask')
   @HttpCode(200)
-  async ask(@Body() body: { question: string; session_id: string; train_mode?: boolean; user_name?: string; laravel_token?: string }) {
+  async ask(@Body() body: { question: string; session_id: string; train_mode?: boolean; user_name?: string; laravel_token?: string; module?: string }) {
     const question = (body?.question ?? '').trim();
     const sessionId = (body?.session_id ?? '').trim();
     if (!question) return { answer: 'Please provide a question.' };
     if (!sessionId) return { answer: 'Please provide a session_id.' };
+    const module = body.module === 'STORE' ? 'STORE' : 'HRM';
     return this.langchainService.ask(
       question,
       sessionId,
       body.train_mode ?? false,
       (body.user_name ?? '').trim() || 'Unknown',
       (body.laravel_token ?? '').trim() || undefined,
+      module,
     );
+  }
+
+  @Post('stop')
+  @HttpCode(200)
+  stop(@Body() body: { session_id: string }) {
+    const sessionId = (body?.session_id ?? '').trim();
+    if (!sessionId) return { success: false, message: 'session_id is required.' };
+    this.langchainService.stopGeneration(sessionId);
+    return { success: true };
   }
 
   @Post('validate')

@@ -20,6 +20,15 @@ function formatDateString(value: string): string {
 export function formatCell(value: any): string {
   if (value === null || value === undefined) return '';
   if (typeof value === 'string' && ISO_DATE_RE.test(value)) return formatDateString(value);
+  // `typeof value !== 'object'` is also true for 'function' — a raw function
+  // reference (e.g. a Decimal-like instance whose numeric fields were never
+  // unwrapped upstream, or any other unserialized value) must never fall into
+  // the plain String(value) branch below: String() on a function returns its
+  // full source text, which showed up verbatim as unreadable minified code in
+  // a table cell. Prisma Decimal instances specifically expose .toNumber() —
+  // unwrap those before the generic object-flattening branches run.
+  if (typeof value === 'function') return '';
+  if (typeof value === 'object' && typeof value.toNumber === 'function') return String(value.toNumber());
   if (typeof value !== 'object') return String(value);
   if (Array.isArray(value)) return value.map(formatCell).join(', ');
   if ('name' in value) return String(value.name ?? '');

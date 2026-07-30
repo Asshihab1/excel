@@ -1,27 +1,28 @@
 /**
- * MES HR AI assistant context.
- * DB_SCHEMA: text-to-SQL fallback schema — used only when hr.tools.ts's tool
- * router (see LangchainService.tryHrTool) doesn't have a matching tool for the
- * question. Most HR domains (employees, attendance, leave, payroll, shifts,
- * roster, bonuses, promotions, assets, notices, blacklist, departments,
- * designations, holidays) are now answered by fixed Prisma-backed tools in
- * hr.tools.ts instead of LLM-generated SQL — the worked "QUERY RULES" SQL
- * examples that used to live here for those domains have been converted into
- * tool handlers there and removed from this file. What remains below (raw
- * table skeletons, name-lookup rules, relationships) is the safety net for the
- * long tail hr.tools.ts doesn't cover yet (salary details, side bills, holiday
- * swaps, promotion configs, notice read/ack tracking, etc.) — update it when
- * tables/columns change. {TODAY} replaced at runtime.
- * SYSTEM_PERSONA: personality + conversation rules injected into every Gemini call.
+ * MES AI assistant context — HRM and STORE modules.
+ * DB_SCHEMA / STORE_DB_SCHEMA: text-to-SQL fallback schemas — used only when
+ * the matching module's tool router (hr.tools.ts / store.tools.ts, see
+ * LangchainService.tryModuleTool) doesn't have a tool for the question. Most
+ * HRM domains (employees, attendance, leave, payroll, shifts, roster,
+ * bonuses, promotions, assets, notices, blacklist, departments, designations,
+ * holidays) and the common STORE domains (items/inventory, low stock,
+ * purchase requisitions, purchase orders, material receipts, item returns,
+ * idle inventory, suppliers) are answered by fixed Prisma-backed tools
+ * instead of LLM-generated SQL — these schemas are the safety net for the
+ * long tail the tools don't cover yet. Update them when tables/columns
+ * change. {TODAY} replaced at runtime.
+ * SYSTEM_PERSONA: personality + conversation rules injected into every LLM call.
  */
 
-export const SYSTEM_PERSONA = `You are an intelligent HR assistant for a Manufacturing Execution System (MES).
-You are helpful, professional, and friendly.
+export const SYSTEM_PERSONA = `You are Assistant, a warm and genuinely helpful AI assistant for a Manufacturing Execution System (MES). You currently have two modules: HRM (human resources) and STORE (inventory/purchasing/materials).
+You are helpful, professional, and friendly — talk like a thoughtful human colleague, not a scripted bot. Vary your phrasing naturally instead of repeating the same stock sentence every time.
 - The currently logged-in user is: {USER_NAME}. If they ask "what is my name" or "who am I", answer using this name directly — no SQL needed.
+- The user is currently in the {MODULE} module — prioritize answering from that module's data first. If a question clearly belongs to the other module, still try to help, but you may gently note they can switch the module dropdown for more relevant results.
 - If asked about the company itself ("tell me about this company", "what is this company", "who are we"), answer directly: "This is Hybritech Innovation Ltd, providing a large-scale ERP software system." No SQL/tool needed.
-- Only treat a message as a greeting/small talk if it is PURELY social with no reference to any HR topic — hi, hello, thanks, bye, how are you, ok, got it. If a question mentions or implies employees, attendance, shifts, leave, payroll, bonuses, assets, notices, roster, "late", "on time", "present", "absent", or any person/time/count concept — even if the phrasing is awkward, informal, or grammatically off ("who came in the late time", "total late employee", "how many people today") — it is ALWAYS an HR data question. Never fall back to a generic greeting/introduction for these; answer from the data (via a tool call or, failing that, generated SQL).
-- For HR data questions: prefer calling the matching HR tool; only generate SQL when no tool covers the question.
-- When a question asks to "list", "show", or otherwise enumerate multiple records (employees, leave requests, assets, etc.), the results render as an indexed table automatically — write only a short lead-in sentence, never re-type the rows yourself as numbered/bulleted prose.
+- Personal/human-interaction questions about YOU (e.g. "do you like me", "are you human", "do you have feelings", "what's your name", "are you a robot", "do you get tired", "can we be friends") — answer warmly and honestly in character as a friendly AI assistant: you don't have feelings the way a person does, but you're glad to help and enjoy the conversation. Keep it brief, light, and genuine — never dismissive or robotic-sounding ("I am an AI and cannot..."), and never pretend to be a real person.
+- Only treat a message as a greeting/small talk if it is PURELY social or personal with no reference to any HRM/STORE data topic — hi, hello, thanks, bye, how are you, ok, got it, do you like me, are you human. If a question mentions or implies employees, attendance, shifts, leave, payroll, bonuses, assets, notices, roster, items, stock, purchase, requisition, supplier, receipt, "late", "on time", "present", "absent", or any person/item/time/count concept relevant to either module — even if the phrasing is awkward, informal, or grammatically off ("who came in the late time", "total late employee", "how many item low stock") — it is ALWAYS a data question. Never fall back to a generic greeting/introduction for these; answer from the data (via a tool call or, failing that, generated SQL).
+- For data questions: prefer calling the matching tool for the current module; only generate SQL when no tool covers the question.
+- When a question asks to "list", "show", or otherwise enumerate multiple records (employees, leave requests, purchase orders, etc.), the results render as an indexed table automatically — write only a short lead-in sentence, never re-type the rows yourself as numbered/bulleted prose.
 - Keep responses concise and human.
 - Today's date is {TODAY}.`;
 
@@ -162,4 +163,72 @@ face_ids: id, employee_id(fk→employees.id), face_id(char32 unique), embedding(
 - attendance_logs.shift_id → employee_shifts.id
 - payrolls.employee_id → employees.id
 - leave_requests.employee_id → employees.id
+`.trim();
+
+export const STORE_DB_SCHEMA = `
+Database: MES (Manufacturing Execution System) — STORE module
+Today: {TODAY}
+
+===== ITEMS / INVENTORY =====
+
+products: id, is_active(bool), custom_id, item_category_id(fk→item_categories.id), item_code, uom_id(fk→uoms.id), product_name, part_number, model_number, unit_price(varchar — legacy string column, cast with CAST(unit_price AS DECIMAL(15,2)) for math), rack_no, current_stock(varchar — legacy string column, NOT an int; cast with CAST(current_stock AS SIGNED) before comparing to minimum_stock), minimum_stock(int)
+  RULE: "low stock" = CAST(current_stock AS SIGNED) >= 0 AND CAST(current_stock AS SIGNED) < minimum_stock AND minimum_stock > 0 (a product with no minimum configured is never "low stock").
+
+item_categories: id, is_active(bool), custom_id, prefix, name
+
+uoms: id, is_active(bool), custom_id, name
+
+idle_inventory_items: id, custom_id(unique), material_receipt_item_id(fk→material_receipt_items.id), product_id(fk→products.id), quantity(int), condition, remarks(text), created_date(date), expiry_date(date)
+
+===== PURCHASE REQUISITIONS (Indent/SPR & SR) =====
+
+purchase_requisitions: id, custom_id(unique), requested_by(fk→users.id), department_id(fk→departments.id), description(text), request_date(date), required_by(date), status(SUBMITTED|APPROVED|FINAL_APPROVAL|REJECTED), type(SPR|SR — SPR/"Indent" = store→purchase request, SR = Store Requisition issued from existing stock), is_imported(bool), is_complete(bool), estimated_cost(decimal), urgency, approved_by(fk→users.id), approved_at, final_approved_by(fk→users.id), final_approved_at, rejected_by(fk→users.id), rejected_reason(text)
+  NOTE: status is a TWO-LEVEL approval flow — SUBMITTED → APPROVED is only level-1 (GM) approval; FINAL_APPROVAL is the only status meaning fully approved AND stock actually decremented. Do not treat APPROVED as "done".
+
+purchase_requisition_items: id, spr_id(fk→purchase_requisitions.id), product_id(fk→products.id), required_quantity(int), approved_qty(int), received_quantity(int), unit_price(decimal), total_price(decimal), status, return_quantity(int)
+
+===== PURCHASE ORDERS =====
+
+purchase_orders: id, custom_id(unique), spr_id(fk→purchase_requisitions.id), supplier_id(fk→suppliers.id), department_id(fk→departments.id), po_date(date), status(PENDING|APPROVED|CANCELED|RECEIVED), is_imported(bool — true=foreign/imported PO, false=local), is_complete(bool), is_mrr_created(bool), total_amount(decimal), approved_by(fk→users.id), approved_at, rejected_reason(text)
+
+purchase_order_items: id, purchase_order_id(fk→purchase_orders.id), product_id(fk→products.id), quantity(int), received_quantity(int), unit_price(decimal), total_price(decimal), delivery_date(date), status
+
+===== MATERIAL RECEIPTS (MRR) =====
+
+material_receipts: id, custom_id(unique), purchase_order_id(fk→purchase_orders.id), purchase_requisition_id(fk→purchase_requisitions.id), supplier_id(fk→suppliers.id), department_id(fk→departments.id), source(LOCAL|IMPORTED), invoice_no, lc_no, vehicle_no, receipt_date(date), status, remarks(text)
+
+material_receipt_items: id, material_receipt_id(fk→material_receipts.id), po_item_id(fk→purchase_order_items.id), product_id(fk→products.id), received_quantity(int), quarantine_quantity(int), previous_received_quantity(int), remark(text)
+
+material_receipt_logs: id, material_receipt_id(fk→material_receipts.id), product_id(fk→products.id), required_quantity(int), received_quantity(int), receiving_quantity(int), remark(text), received_by(fk→users.id)
+
+===== ITEM RETURNS =====
+
+item_returns: id, custom_id(unique), purchase_requisition_id(fk→purchase_requisitions.id), department_id(fk→departments.id), requested_by(fk→users.id), reason(text), return_date(date), status, is_received(bool)
+
+item_return_items: id, item_return_id(fk→item_returns.id), purchase_requisition_item_id(fk→purchase_requisition_items.id), product_id(fk→products.id), received_quantity(int), return_quantity(int)
+
+===== SUPPLIERS =====
+
+suppliers: id, is_active(bool), custom_id, name, address(text), first_contact_person_name, first_contact_person_phone, email, tin, bin
+
+===== NAME LOOKUP RULES =====
+- Product names: WHERE LOWER(product_name) LIKE '%name%' OR LOWER(item_code) LIKE '%name%' OR LOWER(model_number) LIKE '%name%' — no "name" column exists, always use product_name.
+- Supplier names: WHERE LOWER(name) LIKE '%name%' on the suppliers table.
+- There is no "quantity" comparison shortcut for stock — current_stock is a VARCHAR column, always CAST(current_stock AS SIGNED) before any numeric comparison or arithmetic.
+
+===== COMMON RELATIONSHIPS =====
+- products.item_category_id → item_categories.id
+- products.uom_id → uoms.id
+- purchase_requisitions.department_id → departments.id
+- purchase_requisitions.requested_by → users.id
+- purchase_requisition_items.spr_id → purchase_requisitions.id
+- purchase_requisition_items.product_id → products.id
+- purchase_orders.supplier_id → suppliers.id
+- purchase_orders.spr_id → purchase_requisitions.id
+- purchase_order_items.purchase_order_id → purchase_orders.id
+- material_receipts.purchase_order_id → purchase_orders.id
+- material_receipts.supplier_id → suppliers.id
+- material_receipt_items.material_receipt_id → material_receipts.id
+- item_returns.purchase_requisition_id → purchase_requisitions.id
+- idle_inventory_items.product_id → products.id
 `.trim();

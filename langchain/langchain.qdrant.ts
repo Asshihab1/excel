@@ -89,6 +89,54 @@ function sameDomain(question: string, candidateQuestion: string): boolean {
   return false;
 }
 
+// Words that carry no identifying information on their own — question
+// scaffolding, pronouns, filler verbs. Stripping these (plus DOMAIN_KEYWORDS,
+// which are category words, not identifiers) from a question leaves only the
+// SPECIFIC subject it's actually about — a name, a department, a shift
+// letter, whatever varies between two otherwise-identical-shaped questions.
+const GENERIC_QUESTION_WORDS = new Set([
+  'who', 'is', 'are', 'was', 'were', 'what', 'when', 'where', 'why', 'how',
+  'his', 'her', 'hers', 'him', 'he', 'she', 'they', 'their', 'them', 'the', 'and',
+  'of', 'in', 'on', 'for', 'to', 'from', 'with', 'about', 'tell', 'me', 'show',
+  'list', 'find', 'get', 'give', 'my', 'you', 'your', 'we', 'our', 'us', 'please',
+  'does', 'did', 'can', 'could', 'would', 'should', 'will', 'that', 'this', 'these',
+  'those', 'not', 'yes', 'has', 'have', 'had', 'been', 'being', 'its', 'all', 'any',
+  'some', 'than', 'then', 'more', 'most', 'much', 'many', 'named', 'name', 'called',
+]);
+
+function specificTokensOf(text: string): Set<string> {
+  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const tokens = new Set<string>();
+  for (const w of words) {
+    if (w.length < 3) continue;
+    if (GENERIC_QUESTION_WORDS.has(w)) continue;
+    if (DOMAIN_KEYWORDS.includes(w)) continue;
+    tokens.add(w);
+  }
+  return tokens;
+}
+
+// Guards against embedding similarity alone matching two questions whose
+// TEMPLATE is near-identical but whose SPECIFIC SUBJECT differs — "who is
+// arif" vs a cached "who is shihab" score very high on template similarity
+// (the sentence structure dominates the embedding; a single name barely
+// moves it) even though they're about two different people. Without this,
+// a high-confidence match (>= HIGH_CONFIDENCE_SCORE) replays the OLD
+// person's cached tool args/SQL verbatim, no adaptation, wrong answer,
+// silently — the same class of bug sameDomain()/sameIntent() catch for
+// domain/shape collisions, but for the actual subject identity.
+// True if neither question has a specific identifying token (nothing to
+// compare, score stands alone), or both do and share at least one. False
+// only when both have identifying tokens and none overlap.
+function sameSpecificEntity(question: string, candidateQuestion: string): boolean {
+  const a = specificTokensOf(question);
+  if (a.size === 0) return true;
+  const b = specificTokensOf(candidateQuestion);
+  if (b.size === 0) return true;
+  for (const t of a) if (b.has(t)) return true;
+  return false;
+}
+
 // Same domain noun (e.g. "attendance"/"payroll") isn't enough — a same-domain
 // question can still be a fundamentally different SHAPE of query than what a
 // cached reference answers, and adaptReferenceSql()'s "change a name/date/
@@ -282,6 +330,7 @@ export class LangchainQdrantService {
         if (knownBad.has(key)) continue;
         if (!sameDomain(question, payload.question)) continue;
         if (!sameIntent(question, payload.question)) continue;
+        if (!sameSpecificEntity(question, payload.question)) continue;
         return {
           question: payload.question,
           sql: payload.sql,
@@ -437,6 +486,7 @@ export class LangchainQdrantService {
         .filter((e) => e.bad_ratio <= e.good_ratio)
         .filter((e) => sameDomain(question, e.question))
         .filter((e) => sameIntent(question, e.question))
+        .filter((e) => sameSpecificEntity(question, e.question))
         .sort((a, b) => (b.good_ratio - b.bad_ratio) - (a.good_ratio - a.bad_ratio) || b.score - a.score);
       return candidates[0] ?? null;
     } catch (err: any) {
